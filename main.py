@@ -50,7 +50,7 @@ COMBO_FOLDER  = os.environ.get("COMBO_FOLDER", "/data/combo")
 COOKIE_FILE   = os.environ.get("COOKIE_FILE", "/data/full_cookie.txt")
 API_PORT      = int(os.environ.get("API_PORT", "8080"))
 MAX_RETRIES   = int(os.environ.get("MAX_RETRIES", "3"))
-TIMEOUT       = int(os.environ.get("TIMEOUT", "5000")) / 1000  # ms → seconds
+TIMEOUT       = int(os.environ.get("TIMEOUT", "15000")) / 1000  # ms → seconds — residential proxies need more time
 DELAY_MS      = int(os.environ.get("DELAY_MS", "0"))           # 0 = no delay
 BOT_MODE      = os.environ.get("BOT_MODE", "true").lower() in ("true", "1", "yes")
 NUM_WORKERS   = int(os.environ.get("NUM_WORKERS", "20"))        # parallel fetch workers
@@ -64,6 +64,10 @@ import logging
 for _lib in ("urllib3", "requests", "httpcore", "httpx"):
     logging.getLogger(_lib).setLevel(logging.CRITICAL)
     logging.getLogger(_lib).propagate = False
+
+# Suppress InsecureRequestWarning from verify=False (residential proxy tunnels)
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger("ddbot")
 logger.setLevel(logging.DEBUG if not BOT_MODE else logging.INFO)
@@ -212,7 +216,8 @@ class ProxyScanner:
         self._lock = threading.Lock()
         self._cycle = 0
         self._rescan_every = rescan_every
-        self._file_stats = {}  # {filename: proxy_count}
+        self._file_stats = {}   # {filename: proxy_count}
+        self._thread_idx = {}   # {thread_id: per-thread proxy index}
         os.makedirs(self.folder, exist_ok=True)
         self.rescan()
 
@@ -222,6 +227,7 @@ class ProxyScanner:
             old_n = len(self.proxies)
             self.proxies = []
             self._file_stats = {}
+            self._thread_idx = {}   # reset per-thread indices on rescan
 
             if not os.path.isdir(self.folder):
                 logger.warning(f"[PROXY] Folder not found: {self.folder}")
@@ -270,13 +276,19 @@ class ProxyScanner:
         if len(parts) == 2:
             return f"http://{parts[0]}:{parts[1]}"
         elif len(parts) == 4:
-            # Format: ip:port:user:pass → http://user:pass@ip:port
-            ip, port, user, passwd = parts
-            return f"http://{user}:{passwd}@{ip}:{port}"
+            # Format: host:port:user:pass → https://user:pass@host:port
+            # Must use https:// for rotating residential proxies (floppydata, etc.)
+            host, port, user, passwd = parts
+            return f"https://{user}:{passwd}@{host}:{port}"
         return None
 
-    def get_next(self):
-        """Get next proxy. Returns (dict, url) or (None, None)."""
+    def get_next(self, thread_id=None):
+        """Get next proxy for a specific thread (or global round-robin if no thread_id).
+        
+        Each thread_id gets its OWN rotating index — so thread-0 cycles through
+        proxy-0, proxy-1, proxy-2 … independently from thread-1, thread-2, etc.
+        This prevents multiple threads from hammering the same proxy at the same time.
+        """
         with self._lock:
             self._cycle += 1
             # Auto-rescan
@@ -285,8 +297,17 @@ class ProxyScanner:
 
             if not self.proxies:
                 return None, None
-            proxy_url = self.proxies[self.idx % len(self.proxies)]
-            self.idx += 1
+
+            if thread_id is not None:
+                # Per-thread counter: thread N starts at offset N, steps by NUM_WORKERS
+                if thread_id not in self._thread_idx:
+                    self._thread_idx[thread_id] = thread_id  # staggered start
+                proxy_url = self.proxies[self._thread_idx[thread_id] % len(self.proxies)]
+                self._thread_idx[thread_id] += 1
+            else:
+                proxy_url = self.proxies[self.idx % len(self.proxies)]
+                self.idx += 1
+
             return {"http": proxy_url, "https": proxy_url}, proxy_url
 
     def _do_rescan_locked(self):
@@ -934,64 +955,56 @@ class ComboStats:
 #  DATADOME FETCHER
 # ═══════════════════════════════════════════════════════════════
 class DataDomeFetcher:
-    """Fetches fresh DataDome cookies via rotated proxies. No interval — as fast as proxy allows."""
+    """Fetches fresh DataDome cookies via rotated proxies.
+    
+    Uses a FRESH session per request so residential proxies rotate
+    their IP on every single fetch — no session reuse / IP stickiness.
+    """
 
     def __init__(self, scanner: ProxyScanner, max_retries=3, timeout=5.0):
         self.scanner = scanner
         self.max_retries = max_retries
         self.timeout = timeout
-        self._sessions: dict = {}       # proxy_url → requests.Session (connection reuse)
-        self._session_lock = threading.Lock()
-        # Payload is now randomized per-request via _random_fingerprint()
 
-    def _get_session(self, proxy_url: str, proxy_dict: dict) -> requests.Session:
-        """Return a cached Session for this proxy, creating one if needed."""
-        with self._session_lock:
-            session = self._sessions.get(proxy_url)
-            if session is None:
-                session = requests.Session()
-                session.proxies.update(proxy_dict)
-                # Keep-alive adapter: up to 10 connections per proxy, 20 total
-                adapter = requests.adapters.HTTPAdapter(
-                    pool_connections=10,
-                    pool_maxsize=10,
-                    max_retries=0,          # we handle retries ourselves
-                )
-                session.mount("http://", adapter)
-                session.mount("https://", adapter)
-                self._sessions[proxy_url] = session
-                # Prune old sessions if too many proxies loaded (avoid memory leak)
-                if len(self._sessions) > 500:
-                    oldest = next(iter(self._sessions))
-                    old = self._sessions.pop(oldest)
-                    try:
-                        old.close()
-                    except Exception:
-                        pass
-            return session
+    @staticmethod
+    def _make_session(proxy_dict: dict) -> requests.Session:
+        """Create a brand-new session for one request — ensures IP rotation on residential proxies."""
+        session = requests.Session()
+        session.proxies.update(proxy_dict)
+        session.verify = False   # residential proxies often have self-signed tunnel certs
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=1,
+            pool_maxsize=1,
+            max_retries=0,
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
 
-    def invalidate_session(self, proxy_url: str):
-        """Remove cached session for a dead/errored proxy."""
-        with self._session_lock:
-            session = self._sessions.pop(proxy_url, None)
-            if session:
-                try:
-                    session.close()
-                except Exception:
-                    pass
+    def fetch(self, thread_id=None):
+        """Fetch one fresh datadome. Returns dict: {success, datadome, proxy, error, latency_ms}
 
-    def fetch(self):
-        """Fetch one fresh datadome. Returns dict: {success, datadome, proxy, error, latency_ms}"""
-        proxy_dict, proxy_url = self.scanner.get_next()
+        thread_id — pass the worker thread index so each thread rotates its own
+        proxy slot independently (no two threads share the same proxy at the same time).
+        """
+        proxy_dict, proxy_url = self.scanner.get_next(thread_id=thread_id)
         if proxy_dict is None:
             return {"success": False, "datadome": None, "proxy": "NONE", "error": "No proxies", "latency_ms": 0}
 
         for attempt in range(self.max_retries):
+            # Fresh proxy every retry too — keep same thread slot
+            if attempt > 0:
+                proxy_dict, proxy_url = self.scanner.get_next(thread_id=thread_id)
+
             t0 = time.time()
+            session = self._make_session(proxy_dict)
             try:
-                session = self._get_session(proxy_url, proxy_dict)
                 headers, encoded_data = _random_fingerprint()
-                resp = session.post(_DD_URL, headers=headers, data=encoded_data, timeout=self.timeout)
+                resp = session.post(
+                    _DD_URL, headers=headers, data=encoded_data,
+                    timeout=(10, self.timeout),   # (connect_timeout, read_timeout)
+                    verify=False,
+                )
                 latency = int((time.time() - t0) * 1000)
                 resp.raise_for_status()
                 body = resp.json()
@@ -1000,33 +1013,34 @@ class DataDomeFetcher:
                     dd = body["cookie"].split(";")[0].split("=", 1)[1]
                     return {"success": True, "datadome": dd, "proxy": self.scanner.current_display(), "error": None, "latency_ms": latency}
 
-                if attempt < self.max_retries - 1:
-                    proxy_dict, proxy_url = self.scanner.get_next()
-                    continue
-                return {"success": False, "datadome": None, "proxy": self.scanner.current_display(), "error": f"DD status: {body.get('status')}", "latency_ms": latency}
+                # Non-200 DD status — try next proxy
+                err = f"DD status: {body.get('status')} body: {str(body)[:120]}"
+                logger.debug(f"[FETCH] {err} | proxy: {proxy_url}")
+                continue
 
-            except requests.exceptions.ProxyError:
-                self.invalidate_session(proxy_url)   # dead proxy — drop its session
-                if attempt < self.max_retries - 1:
-                    proxy_dict, proxy_url = self.scanner.get_next()
-                    continue
-                return {"success": False, "datadome": None, "proxy": self.scanner.current_display(), "error": "ProxyError", "latency_ms": int((time.time()-t0)*1000)}
+            except requests.exceptions.ProxyError as e:
+                logger.debug(f"[FETCH] ProxyError on {proxy_url}: {e}")
+                continue
 
             except requests.exceptions.Timeout:
-                self.invalidate_session(proxy_url)   # timed-out proxy — drop its session
-                if attempt < self.max_retries - 1:
-                    proxy_dict, proxy_url = self.scanner.get_next()
-                    continue
-                return {"success": False, "datadome": None, "proxy": self.scanner.current_display(), "error": "Timeout", "latency_ms": int((time.time()-t0)*1000)}
+                logger.debug(f"[FETCH] Timeout on {proxy_url}")
+                continue
+
+            except requests.exceptions.ConnectionError as e:
+                logger.debug(f"[FETCH] ConnError on {proxy_url}: {e}")
+                continue
 
             except Exception as e:
-                self.invalidate_session(proxy_url)
-                if attempt < self.max_retries - 1:
-                    proxy_dict, proxy_url = self.scanner.get_next()
-                    continue
-                return {"success": False, "datadome": None, "proxy": self.scanner.current_display(), "error": str(e), "latency_ms": int((time.time()-t0)*1000)}
+                logger.debug(f"[FETCH] Error on {proxy_url}: {e}")
+                continue
 
-        return {"success": False, "datadome": None, "proxy": self.scanner.current_display(), "error": "Max retries", "latency_ms": 0}
+            finally:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+        return {"success": False, "datadome": None, "proxy": self.scanner.current_display(), "error": "All retries failed", "latency_ms": 0}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1819,14 +1833,14 @@ class DataDomeBotEngine:
         cycle_lock = threading.Lock()
         last_stats_log = [time.time()]
 
-        def worker_loop():
+        def worker_loop(thread_id):
             while not self.shutdown_event.is_set():
                 if DELAY_MS > 0:
                     self.shutdown_event.wait(timeout=DELAY_MS / 1000.0)
                     if self.shutdown_event.is_set():
                         break
 
-                result = self.fetcher.fetch()
+                result = self.fetcher.fetch(thread_id=thread_id)
 
                 with cycle_lock:
                     cycle_counter[0] += 1
@@ -1865,7 +1879,7 @@ class DataDomeBotEngine:
                             )
 
         with ThreadPoolExecutor(max_workers=NUM_WORKERS, thread_name_prefix="ddworker") as pool:
-            futures = [pool.submit(worker_loop) for _ in range(NUM_WORKERS)]
+            futures = [pool.submit(worker_loop, i) for i in range(NUM_WORKERS)]
             self.shutdown_event.wait()
 
         # Shutdown
