@@ -437,7 +437,7 @@ class CookieUpdater:
         self._load_cache()
 
     # Maximum cookie lines to keep in memory and on disk
-    MAX_COOKIE_LINES = 500
+    MAX_COOKIE_LINES = 5000
 
     def _load_cache(self):
         """Load all non-empty, non-comment cookie lines into memory — capped at MAX_COOKIE_LINES."""
@@ -574,7 +574,7 @@ class CookieUpdater:
     def update_datadome(self, new_value: str) -> dict:
         """Inject fresh datadome into EVERY line in the cookie file.
 
-        All 500 lines get updated in one atomic write — no reload needed.
+        All 5000 lines get updated in one atomic write — no reload needed.
         Returns {"success": bool, "lines_changed": int, "error": str|None}
         """
         with self._lock:
@@ -690,13 +690,13 @@ class CookieUpdater:
             return best
 
     def read_all_cookies(self) -> list[str]:
-        """Return ALL cookie lines (all accounts) with their current datadome values.
-
-        Used by the /cookie API endpoint — streams all lines so external checkers
-        always get fresh values without reloading.
+        """Return ALL cookie lines shuffled — so every checker request gets a different
+        cookie order and no single cookie gets hammered repeatedly.
         """
         with self._lock:
-            return list(self._lines_cache)
+            copy = list(self._lines_cache)
+        random.shuffle(copy)
+        return copy
 
     def write_cookie(self, cookie_string: str):
         """Write/overwrite the cookie file — capped at MAX_COOKIE_LINES.
@@ -1626,7 +1626,7 @@ class TelegramBot:
             if not args:
                 self.send_important(
                     "Usage: /cookieset [cookie string]\n\n"
-                    "Para sa maraming cookies (500 accounts), i-upload nalang ang .txt file gamit ang 📤 Upload Combo\n\n"
+                    "Para sa maraming cookies (5000 accounts), i-upload nalang ang .txt file gamit ang 📤 Upload Combo\n\n"
                     "O i-paste rito (one cookie per line):\n"
                     "<code>/cookieset datadome=xxx; sso_key=yyy; ...</code>",
                     chat_id
@@ -1904,7 +1904,7 @@ class TelegramBot:
                 "I-send ang <code>.txt</code> file na may full cookies.\n"
                 "One complete cookie string per line (lahat ng fields):\n\n"
                 "<code>datadome=xxx; sso_key=yyy; PHPSESSID=zzz; ...</code>\n\n"
-                "Puwede 1 line o hanggang 500+ lines — lahat ay awtomatikong\n"
+                "Puwede 1 line o hanggang 5000+ lines — lahat ay awtomatikong\n"
                 "maa-update ng fresh datadome every fetch cycle. ✅"
             )
         elif kind == "combo":
@@ -1933,7 +1933,7 @@ class TelegramBot:
     # ── File upload handlers ────────────────────────────────────────
 
     # Max lines accepted per upload type
-    _MAX_COOKIE_LINES = 500
+    _MAX_COOKIE_LINES = 5000
     _MAX_PROXY_LINES  = 50_000
     _MAX_COMBO_LINES  = 100_000
 
@@ -2142,10 +2142,14 @@ class APIHandler(BaseHTTPRequestHandler):
             self._text_response((dd or "NONE")[:5000])
 
         elif path == "/cookie" or path == "/cookies":
-            # ALL cookie lines — every account, datadome already fresh (no reload needed)
-            # One full cookie per line, plain text
+            # ALL cookie lines — shuffled so every request returns different order
+            # External checkers (dec_tyrantv12) always get fresh, varied cookies
             lines = self._updater.read_all_cookies() if self._updater else []
-            content = "\n".join(lines) if lines else "NONE"
+            if not lines:
+                self._text_response("NONE")
+                return
+            # Return all lines shuffled — checker picks from top
+            content = "\n".join(lines)
             self._text_response(content)
 
         elif path == "/stats":
@@ -2518,55 +2522,102 @@ class DataDomeBotEngine:
         last_stats_log = [time.time()]
 
         def worker_loop(thread_id):
+            consecutive_errors = 0
             while not self.shutdown_event.is_set():
-                # ── Pause gate — workers wait here during /setdatadome inject ──
-                if not self.dd_pool.ready.is_set():
-                    self.dd_pool.ready.wait(timeout=60)
-                    if self.shutdown_event.is_set():
-                        break
+                try:
+                    # ── Pause gate — workers wait here during /setdatadome inject ──
+                    if not self.dd_pool.ready.is_set():
+                        self.dd_pool.ready.wait(timeout=30)
+                        if self.shutdown_event.is_set():
+                            break
 
-                if DELAY_MS > 0:
-                    self.shutdown_event.wait(timeout=DELAY_MS / 1000.0)
-                    if self.shutdown_event.is_set():
-                        break
+                    if DELAY_MS > 0:
+                        self.shutdown_event.wait(timeout=DELAY_MS / 1000.0)
+                        if self.shutdown_event.is_set():
+                            break
 
-                result = self.fetcher.fetch(thread_id=thread_id)
+                    result = self.fetcher.fetch(thread_id=thread_id)
 
-                with cycle_lock:
-                    cycle_counter[0] += 1
-
-                if result["success"]:
-                    dd = result["datadome"]
-                    dd_short = dd[:30] + "..." if len(dd) > 30 else dd
-                    update = self.updater.update_datadome(dd)
-                    self.stats.record_fetch(True, result.get("latency_ms", 0), update.get("success", False))
-                    self.dd_pool.record_success(dd)
-
-                    if not BOT_MODE:
-                        logger.debug(f"[BOT] ✔ {dd_short} | {result.get('latency_ms', 0)}ms | proxy: {result['proxy']}")
-                else:
-                    self.stats.record_fetch(False)
-                    current_dd = self.dd_pool.get_best()
-                    if current_dd:
-                        self.dd_pool.record_failure(current_dd)
-                    if not BOT_MODE:
-                        logger.debug(f"[BOT] ✘ {result.get('error', '?')} | proxy: {result.get('proxy', '?')}")
-
-                # ── Console stats log every 30s (one thread wins the lock) ──
-                now = time.time()
-                if now - last_stats_log[0] > 30:
                     with cycle_lock:
-                        if now - last_stats_log[0] > 30:
-                            last_stats_log[0] = now
-                            s = self.stats.get_stats()
-                            logger.info(
-                                f"[BOT] 📊 {s['fetched']} fetched | {s['updated']} updated | "
-                                f"{s['failed']} failed | avg: {s['avg_latency_ms']}ms"
-                            )
+                        cycle_counter[0] += 1
 
-        with ThreadPoolExecutor(max_workers=NUM_WORKERS, thread_name_prefix="ddworker") as pool:
-            futures = [pool.submit(worker_loop, i) for i in range(NUM_WORKERS)]
-            self.shutdown_event.wait()
+                    if result["success"]:
+                        dd = result["datadome"]
+                        dd_short = dd[:30] + "..." if len(dd) > 30 else dd
+                        update = self.updater.update_datadome(dd)
+                        self.stats.record_fetch(True, result.get("latency_ms", 0), update.get("success", False))
+                        self.dd_pool.record_success(dd)
+                        consecutive_errors = 0  # reset on success
+
+                        if not BOT_MODE:
+                            logger.debug(f"[BOT] ✔ {dd_short} | {result.get('latency_ms', 0)}ms | proxy: {result['proxy']}")
+                    else:
+                        self.stats.record_fetch(False)
+                        current_dd = self.dd_pool.get_best()
+                        if current_dd:
+                            self.dd_pool.record_failure(current_dd)
+                        if not BOT_MODE:
+                            logger.debug(f"[BOT] ✘ {result.get('error', '?')} | proxy: {result.get('proxy', '?')}")
+
+                    # ── Console stats log every 30s (one thread wins the lock) ──
+                    now = time.time()
+                    if now - last_stats_log[0] > 30:
+                        with cycle_lock:
+                            if now - last_stats_log[0] > 30:
+                                last_stats_log[0] = now
+                                s = self.stats.get_stats()
+                                logger.info(
+                                    f"[BOT] 📊 {s['fetched']} fetched | {s['updated']} updated | "
+                                    f"{s['failed']} failed | avg: {s['avg_latency_ms']}ms"
+                                )
+
+                except Exception as e:
+                    # ── CRITICAL: never let an exception kill a worker thread ──
+                    # Without this, one unexpected error = worker gone forever.
+                    consecutive_errors += 1
+                    logger.warning(f"[WORKER-{thread_id}] Unhandled error (#{consecutive_errors}): {e}")
+                    if consecutive_errors >= 10:
+                        # Too many consecutive errors — brief cooldown then reset
+                        logger.warning(f"[WORKER-{thread_id}] 10 consecutive errors — cooling down 5s...")
+                        self.shutdown_event.wait(5)
+                        consecutive_errors = 0
+                    else:
+                        # Small sleep to avoid tight error loop hammering CPU
+                        self.shutdown_event.wait(0.5)
+
+        # ── Use daemon threads instead of ThreadPoolExecutor ──
+        # ThreadPoolExecutor: kapag nag-crash ang future, wala itong auto-restart.
+        # Daemon threads: kahit may error, ang main loop ay hindi affected.
+        worker_threads = []
+        for i in range(NUM_WORKERS):
+            t = threading.Thread(
+                target=worker_loop, args=(i,),
+                name=f"ddworker-{i}", daemon=True
+            )
+            t.start()
+            worker_threads.append(t)
+
+        logger.info(f"[BOT] ✅ {NUM_WORKERS} worker threads started")
+
+        # ── Monitor thread — auto-restart any dead worker ──
+        def monitor_workers():
+            while not self.shutdown_event.is_set():
+                self.shutdown_event.wait(30)  # check every 30s
+                if self.shutdown_event.is_set():
+                    break
+                for i, t in enumerate(worker_threads):
+                    if not t.is_alive():
+                        logger.warning(f"[MONITOR] Worker-{i} died — restarting...")
+                        new_t = threading.Thread(
+                            target=worker_loop, args=(i,),
+                            name=f"ddworker-{i}-restart", daemon=True
+                        )
+                        new_t.start()
+                        worker_threads[i] = new_t
+
+        threading.Thread(target=monitor_workers, name="worker-monitor", daemon=True).start()
+
+        self.shutdown_event.wait()
 
         # Shutdown
         logger.info("[BOT] ⚠ Shutting down...")
