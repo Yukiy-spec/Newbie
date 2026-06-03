@@ -2540,15 +2540,6 @@ class DataDomeBotEngine:
 
                     if not BOT_MODE:
                         logger.debug(f"[BOT] ✔ {dd_short} | {result.get('latency_ms', 0)}ms | proxy: {result['proxy']}")
-
-                    # ── Auto-notify via TelegramBot.auto_notify — guaranteed 1 msg per interval ──
-                    stats = self.stats.get_stats()
-                    self.tg.auto_notify(
-                        f"🔄 <b>DataDome Live</b>\n"
-                        f"✔ Fetched: {stats['fetched']} | ↻ Updated: {stats['updated']}\n"
-                        f"⚡ Avg: {stats.get('avg_latency_ms', 0)}ms\n"
-                        f"🔄 Proxies: {self.scanner.total} | Workers: {NUM_WORKERS}"
-                    )
                 else:
                     self.stats.record_fetch(False)
                     current_dd = self.dd_pool.get_best()
