@@ -2303,16 +2303,20 @@ class DataDomeBotEngine:
                     # ── Time-gated TG notify — only 1 message per TG_NOTIFY_EVERY seconds ──
                     now = time.time()
                     if now - last_tg_notify[0] >= TG_NOTIFY_EVERY:
+                        should_notify = False
                         with cycle_lock:
+                            # Re-check inside the lock — only ONE thread wins
                             if now - last_tg_notify[0] >= TG_NOTIFY_EVERY:
-                                last_tg_notify[0] = now
-                                stats = self.stats.get_stats()
-                                self.tg.send(
-                                    f"🔄 <b>DataDome Live</b>\n"
-                                    f"✔ Fetched: {stats['fetched']} | ↻ Updated: {stats['updated']}\n"
-                                    f"⚡ Avg: {stats.get('avg_latency_ms', 0)}ms\n"
-                                    f"🔄 Proxies: {self.scanner.total} | Workers: {NUM_WORKERS}"
-                                )
+                                last_tg_notify[0] = now  # claim the slot immediately
+                                should_notify = True
+                        if should_notify:
+                            stats = self.stats.get_stats()
+                            self.tg.send(
+                                f"🔄 <b>DataDome Live</b>\n"
+                                f"✔ Fetched: {stats['fetched']} | ↻ Updated: {stats['updated']}\n"
+                                f"⚡ Avg: {stats.get('avg_latency_ms', 0)}ms\n"
+                                f"🔄 Proxies: {self.scanner.total} | Workers: {NUM_WORKERS}"
+                            )
                 else:
                     self.stats.record_fetch(False)
                     current_dd = self.dd_pool.get_best()
