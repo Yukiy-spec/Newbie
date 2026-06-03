@@ -271,15 +271,27 @@ class ProxyScanner:
     @staticmethod
     def _parse(line):
         if "://" in line:
+            # Already has scheme — normalise https:// residential proxies to http://
+            # Residential rotating proxies use HTTP tunneling even if written as https://
+            if line.startswith("https://"):
+                line = "http://" + line[len("https://"):]
             return line
         parts = line.split(":")
         if len(parts) == 2:
+            # host:port
             return f"http://{parts[0]}:{parts[1]}"
         elif len(parts) == 4:
-            # Format: host:port:user:pass → https://user:pass@host:port
-            # Must use https:// for rotating residential proxies (floppydata, etc.)
+            # host:port:user:pass  OR  user:pass:host:port — try both orderings
+            # Most residential proxy providers use host:port:user:pass
             host, port, user, passwd = parts
-            return f"https://{user}:{passwd}@{host}:{port}"
+            # Validate: port should be numeric
+            if port.isdigit():
+                return f"http://{user}:{passwd}@{host}:{port}"
+            else:
+                # Maybe user:pass:host:port ordering
+                user2, passwd2, host2, port2 = parts
+                if port2.isdigit():
+                    return f"http://{user2}:{passwd2}@{host2}:{port2}"
         return None
 
     def get_next(self, thread_id=None):
@@ -689,19 +701,18 @@ _combo_session_lock = threading.Lock()
 
 
 def _get_combo_session(proxy_dict):
-    """Get or create a per-thread cloudscraper session for combo harvesting."""
-    if not hasattr(_combo_thread_local, "session"):
-        try:
-            import cloudscraper as _cloudscraper
-        except ImportError:
-            raise RuntimeError("cloudscraper not installed. Run: pip install cloudscraper")
-        with _combo_session_lock:
-            time.sleep(random.uniform(0.05, 0.2))
-        sess = _cloudscraper.create_scraper()
-        if proxy_dict:
-            sess.proxies.update(proxy_dict)
-        _combo_thread_local.session = sess
-    return _combo_thread_local.session
+    """Create a fresh cloudscraper session for each combo request (ensures IP rotation)."""
+    try:
+        import cloudscraper as _cloudscraper
+    except ImportError:
+        raise RuntimeError("cloudscraper not installed. Run: pip install cloudscraper")
+    with _combo_session_lock:
+        time.sleep(random.uniform(0.05, 0.2))
+    sess = _cloudscraper.create_scraper()
+    if proxy_dict:
+        sess.proxies.update(proxy_dict)
+        sess.verify = False  # residential proxies may have self-signed tunnel certs
+    return sess
 
 
 def _harvest_prelogin(account, proxy_dict, updater=None):
@@ -790,7 +801,7 @@ def _harvest_prelogin(account, proxy_dict, updater=None):
 
         time.sleep(random.uniform(0.1, 0.4))
         try:
-            resp = sess.get(url, headers=headers, params=params, timeout=TIMEOUT + 5)
+            resp = sess.get(url, headers=headers, params=params, timeout=(30, TIMEOUT + 10))
 
             # Extract datadome from Set-Cookie
             set_cookie = resp.headers.get("set-cookie", "")
@@ -812,9 +823,7 @@ def _harvest_prelogin(account, proxy_dict, updater=None):
 
             if resp.status_code == 403:
                 logger.debug(f"[COMBO] 403 on {username} (attempt {attempt+1}) — switching to full cookie on next retry")
-                # Drop stale session — next attempt will use full cookie with fresh datadome
-                if hasattr(_combo_thread_local, "session"):
-                    del _combo_thread_local.session
+                # Fresh session — next attempt will use full cookie with fresh datadome
                 sess = _get_combo_session(proxy_dict)
                 time.sleep(random.uniform(0.5, 1.5))
                 continue
@@ -824,8 +833,8 @@ def _harvest_prelogin(account, proxy_dict, updater=None):
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout,
                 requests.exceptions.ProxyError):
-            if hasattr(_combo_thread_local, "session"):
-                del _combo_thread_local.session
+            # Get a fresh session with new proxy on error
+            sess = _get_combo_session(proxy_dict)
             if attempt < 2:
                 time.sleep(random.uniform(0.5, 1.2))
             continue
@@ -1020,7 +1029,7 @@ class DataDomeFetcher:
                 headers, encoded_data = _random_fingerprint()
                 resp = session.post(
                     _DD_URL, headers=headers, data=encoded_data,
-                    timeout=(10, self.timeout),   # (connect_timeout, read_timeout)
+                    timeout=(30, self.timeout),   # (connect_timeout, read_timeout) — residential proxies need longer connect time
                     verify=False,
                 )
                 latency = int((time.time() - t0) * 1000)
@@ -1070,7 +1079,8 @@ class TelegramBot:
     API_BASE = "https://api.telegram.org/bot"
 
     def __init__(self, token, chat_id, scanner, updater, fetcher, stats_ref,
-                 combo_manager=None, combo_harvester=None, combo_stats=None):
+                 combo_manager=None, combo_harvester=None, combo_stats=None,
+                 dd_pool=None):
         self.token = token
         self.chat_id = chat_id
         self.scanner = scanner
@@ -1080,6 +1090,7 @@ class TelegramBot:
         self.combo_manager = combo_manager
         self.combo_harvester = combo_harvester
         self.combo_stats = combo_stats
+        self.dd_pool = dd_pool
         self._offset = 0
         self._lock = threading.Lock()
         self._allowed_chats = set()
@@ -1251,11 +1262,53 @@ class TelegramBot:
                 )
             return
 
-        # ── Non-command messages (reply flow for /proxynew) ────────
+        # ── Non-command messages (reply flow for /proxynew, setdatadome) ────────
         if not text.startswith("/"):
             pending = self._pending_file.pop(chat_id, None)
             if pending is not None:
                 kind, fname = pending if isinstance(pending, tuple) else ("proxy", pending)
+
+                # ── DataDome inject flow ───────────────────────────────
+                if kind == "datadome_inject":
+                    if not text.strip():
+                        self.send("❌ Walang natanggap na value. Try ulit.", chat_id)
+                        return
+                    if self.dd_pool:
+                        def _do_inject():
+                            result = self.dd_pool.inject(
+                                text.strip(),
+                                fetcher=self.fetcher,
+                                notify_fn=lambda msg: self.send(msg, chat_id)
+                            )
+                            injected = result.get("injected", [])
+                            failed   = result.get("failed", [])
+                            pool_size = self.dd_pool.size()
+
+                            good_block = "\n".join(f"✅ <code>{v[:30]}...</code>" for v in injected) or "❌ None validated"
+                            bad_block  = ("\n\n⚠️ <b>Failed:</b>\n" + "\n".join(f"❌ <code>{v[:30]}...</code>" for v in failed)) if failed else ""
+
+                            self.send(
+                                f"✅ <b>DataDome Inject Complete!</b>\n\n"
+                                f"💉 <b>Injected ({len(injected)}):</b>\n{good_block}"
+                                f"{bad_block}\n\n"
+                                f"🏊 Pool: <b>{pool_size}</b> active value(s)\n"
+                                f"🚀 All {NUM_WORKERS} workers back at full speed!",
+                                chat_id
+                            )
+                        threading.Thread(target=_do_inject, daemon=True).start()
+                    else:
+                        # Fallback — no pool
+                        raw = text.strip().split(",")[0].strip()
+                        if raw.lower().startswith("datadome="):
+                            raw = raw.split("=", 1)[1].strip()
+                        r = self.updater.update_datadome(raw)
+                        self.send(
+                            f"✅ DataDome updated!\n<code>{raw[:40]}...</code>" if r.get("success")
+                            else f"❌ Failed: {r.get('error','?')}",
+                            chat_id
+                        )
+                    return
+
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 if not lines:
                     self.send("❌ No entries found in message.", chat_id)
@@ -1345,34 +1398,61 @@ class TelegramBot:
             if not args:
                 self.send(
                     "💉 <b>Set Fresh DataDome</b>\n\n"
-                    "Usage: /setdatadome [fresh datadome value]\n\n"
-                    "Example:\n<code>/setdatadome AHrlqAAAAAA...</code>\n\n"
-                    "Awtomatiko itong ilalagay sa full cookie file — lahat ng ibang fields (sso_key, PHPSESSID, etc.) ay hindi maaapektuhan.",
+                    "Usage: <code>/setdatadome value1, value2, value3</code>\n\n"
+                    "• Isang value lang → i-validate at i-inject agad\n"
+                    "• Maraming values (comma-separated) → i-validate lahat, i-add sa pool\n\n"
+                    "Habang nag-inject, <b>1 thread lang</b> ang nagva-validate — "
+                    "pagkatapos, bumabalik agad sa full speed!\n\n"
+                    "Example:\n"
+                    "<code>/setdatadome AHrlqAAAA...</code>\n\n"
+                    "Multi:\n"
+                    "<code>/setdatadome AHrlqAAAA..., BZxyAAAA..., CWuvAAAA...</code>",
                     chat_id
                 )
             else:
-                fresh_dd = args[0].strip()
-                # Strip datadome= prefix kung nakapaste yung buong field
-                if fresh_dd.lower().startswith("datadome="):
-                    fresh_dd = fresh_dd.split("=", 1)[1].strip()
-                result = self.updater.update_datadome(fresh_dd)
-                if result.get("success"):
-                    full = self.updater.read_full_cookie()
-                    preview = (full[:80] + "...") if full and len(full) > 80 else (full or "N/A")
-                    self.send(
-                        f"✅ <b>DataDome updated!</b>\n\n"
-                        f"🆕 New value:\n<code>{fresh_dd[:40]}...</code>\n\n"
-                        f"🍪 Full cookie preview:\n<code>{preview}</code>",
-                        chat_id
-                    )
+                raw = " ".join(args)
+                if self.dd_pool:
+                    # Run inject in background thread so bot doesn't block
+                    def _do_inject():
+                        result = self.dd_pool.inject(
+                            raw,
+                            fetcher=self.fetcher,
+                            notify_fn=lambda msg: self.send(msg, chat_id)
+                        )
+                        injected = result.get("injected", [])
+                        failed   = result.get("failed", [])
+                        pool_size = self.dd_pool.size()
+
+                        if injected:
+                            lines = [f"✅ <code>{v[:30]}...</code>" for v in injected]
+                            good_block = "\n".join(lines)
+                        else:
+                            good_block = "❌ None validated"
+
+                        bad_block = ""
+                        if failed:
+                            bad_lines = [f"❌ <code>{v[:30]}...</code>" for v in failed]
+                            bad_block = "\n\n⚠️ <b>Failed validation:</b>\n" + "\n".join(bad_lines)
+
+                        self.send(
+                            f"✅ <b>DataDome Inject Complete!</b>\n\n"
+                            f"💉 <b>Injected ({len(injected)}):</b>\n{good_block}"
+                            f"{bad_block}\n\n"
+                            f"🏊 Pool size: <b>{pool_size}</b> active DD value(s)\n"
+                            f"🚀 All {NUM_WORKERS} workers resumed at full speed!",
+                            chat_id
+                        )
+                    threading.Thread(target=_do_inject, daemon=True).start()
                 else:
-                    err = result.get("error", "unknown error")
-                    self.send(
-                        f"❌ <b>Failed to update DataDome</b>\n\n"
-                        f"Error: {err}\n\n"
-                        f"Baka walang full cookie file pa — i-set muna ang buong cookie gamit ang /cookieset",
-                        chat_id
-                    )
+                    # Fallback: no pool — direct inject (old behaviour)
+                    fresh_dd = args[0].strip()
+                    if fresh_dd.lower().startswith("datadome="):
+                        fresh_dd = fresh_dd.split("=", 1)[1].strip()
+                    result = self.updater.update_datadome(fresh_dd)
+                    if result.get("success"):
+                        self.send(f"✅ DataDome updated!\n\n<code>{fresh_dd[:40]}...</code>", chat_id)
+                    else:
+                        self.send(f"❌ Failed: {result.get('error','?')}", chat_id)
 
     # ── Command handlers (shared by text commands & button callbacks) ──
 
@@ -1456,13 +1536,16 @@ class TelegramBot:
             self.send(text, chat_id)
 
     def _do_setdatadome_prompt(self, chat_id, message_id=None, **_):
-        """Button press — prompt user to send /setdatadome command."""
+        """Button press — set pending state then ask user to paste value(s)."""
+        self._pending_file[chat_id] = ("datadome_inject", None)
         text = (
-            "💉 <b>Set Fresh DataDome</b>\n\n"
-            "I-type ang command na ito tapos i-paste ang fresh datadome value mo:\n\n"
-            "<code>/setdatadome PASTE_FRESH_VALUE_DITO</code>\n\n"
-            "Awtomatiko itong ilalagay sa full cookie — lahat ng ibang fields ay hindi maaapektuhan.\n\n"
-            "Pagkatapos, gumagana na ulit ang bot agad! ✅"
+            "💉 <b>I-paste ang DataDome value mo:</b>\n\n"
+            "Puwede single o marami (comma-separated):\n\n"
+            "<code>AHrlqAAAA...</code>\n\n"
+            "o\n\n"
+            "<code>AHrlqAAAA..., BZxyAAAA..., CWuvAAAA...</code>\n\n"
+            "⏸ Mag-pa-pause ang workers habang nag-va-validate\n"
+            "🚀 Babalik agad sa full speed pagkatapos!"
         )
         if message_id:
             self.edit_message(chat_id, message_id, text)
@@ -1807,8 +1890,152 @@ class Stats:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  MAIN BOT ENGINE
+#  DATADOME POOL  — multi-value pool with smart inject flow
+#
+#  Logic:
+#   1. /setdatadome val1, val2, val3  → inject multiple fresh DDs
+#   2. On inject: pause fetch workers → 1 validation thread confirms
+#      each DD works → replace old expired values → resume full speed
+#   3. Workers round-robin across all valid DD values in pool
+#   4. Expired DDs are auto-retired (tracked per-value success rate)
 # ═══════════════════════════════════════════════════════════════
+class DataDomePool:
+    """
+    Manages a pool of DataDome values.
+    - Holds multiple DD values; workers pick the freshest one round-robin
+    - On manual inject (/setdatadome): pauses workers, validates the new
+      value(s) with a single probe request, then resumes at full speed
+    - Tracks failure count per-value so stale DDs get retired automatically
+    """
+
+    def __init__(self, updater: "CookieUpdater"):
+        self.updater = updater
+        self._lock = threading.Lock()
+        # Each entry: {"value": str, "failures": int, "injected_at": float}
+        self._pool: list[dict] = []
+        self._idx = 0
+        # Event that fetch workers wait on — cleared = workers paused
+        self.ready = threading.Event()
+        self.ready.set()   # start unpaused
+        self._inject_lock = threading.Lock()  # only one inject at a time
+
+    # ── Pool reads ─────────────────────────────────────────────
+    def get_best(self) -> str | None:
+        """Return the current best DD value (fewest failures, most recent)."""
+        with self._lock:
+            if not self._pool:
+                return self.updater.read_current_datadome()
+            # Pick the entry with fewest failures (stable round-robin within tie)
+            best = min(self._pool, key=lambda e: e["failures"])
+            return best["value"]
+
+    def record_success(self, value: str):
+        """Called when a fetch succeeds — resets failure counter for this DD."""
+        with self._lock:
+            for e in self._pool:
+                if e["value"] == value:
+                    e["failures"] = 0
+                    return
+
+    def record_failure(self, value: str):
+        """Called when a fetch fails — increments failure counter; retires at 5."""
+        with self._lock:
+            for e in self._pool:
+                if e["value"] == value:
+                    e["failures"] += 1
+                    if e["failures"] >= 5:
+                        logger.info(f"[POOL] 🗑 Retiring expired DD: {value[:20]}...")
+                        self._pool.remove(e)
+                    return
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._pool)
+
+    # ── Inject ─────────────────────────────────────────────────
+    def inject(self, raw_values: str, fetcher: "DataDomeFetcher",
+               notify_fn=None) -> dict:
+        """
+        Parse comma-separated DD values, pause workers, validate each with
+        a single probe fetch, replace cookie file, then resume workers.
+
+        Returns {"injected": [values], "failed": [values]}
+        """
+        # Parse — support both comma and newline separators
+        parts = [v.strip() for v in raw_values.replace("\n", ",").split(",") if v.strip()]
+        # Strip datadome= prefix if user pasted the full field
+        cleaned = []
+        for p in parts:
+            if p.lower().startswith("datadome="):
+                p = p.split("=", 1)[1].strip()
+            if len(p) >= 20:
+                cleaned.append(p)
+
+        if not cleaned:
+            return {"injected": [], "failed": [], "error": "No valid values found"}
+
+        with self._inject_lock:
+            # ── Step 1: Pause fetch workers ───────────────────
+            logger.info(f"[POOL] ⏸ Pausing {NUM_WORKERS} workers for DD inject ({len(cleaned)} value(s))...")
+            self.ready.clear()
+            if notify_fn:
+                notify_fn(
+                    f"⏸ <b>Pausing workers</b> to inject {len(cleaned)} fresh DataDome value(s)...\n"
+                    f"🔍 Validating with 1 probe thread — will resume full speed after."
+                )
+
+            injected = []
+            failed   = []
+
+            try:
+                # ── Step 2: Validate each value with 1 fetch ──
+                for dd_val in cleaned:
+                    # Temporarily write this DD into cookie so fetcher uses it
+                    self.updater.update_datadome(dd_val)
+                    result = fetcher.fetch(thread_id=None)   # single probe
+
+                    if result.get("success"):
+                        # Good — add to pool (or update if already present)
+                        with self._lock:
+                            existing = next((e for e in self._pool
+                                             if e["value"] == dd_val), None)
+                            if existing:
+                                existing["failures"] = 0
+                                existing["injected_at"] = time.time()
+                            else:
+                                self._pool.append({
+                                    "value": dd_val,
+                                    "failures": 0,
+                                    "injected_at": time.time(),
+                                })
+                        injected.append(dd_val)
+                        logger.info(f"[POOL] ✅ Validated DD: {dd_val[:20]}... — added to pool")
+                    else:
+                        failed.append(dd_val)
+                        logger.warning(
+                            f"[POOL] ❌ DD failed probe: {dd_val[:20]}... "
+                            f"({result.get('error','?')})"
+                        )
+
+                # ── Step 3: Write the freshest valid DD to cookie ──
+                if injected:
+                    self.updater.update_datadome(injected[0])
+                elif failed and not injected:
+                    # All failed — restore whatever was there before
+                    pass
+
+            finally:
+                # ── Step 4: Resume all workers ─────────────────
+                self.ready.set()
+                pool_size = self.size()
+                logger.info(
+                    f"[POOL] ▶ Workers resumed — pool has {pool_size} DD value(s) "
+                    f"({len(injected)} injected, {len(failed)} failed)"
+                )
+
+            return {"injected": injected, "failed": failed}
+
+
 class DataDomeBotEngine:
     """Main engine: continuous fast fetch loop + Telegram + API."""
 
@@ -1825,6 +2052,9 @@ class DataDomeBotEngine:
         # Fetcher (no interval — as fast as possible)
         self.fetcher = DataDomeFetcher(self.scanner, max_retries=MAX_RETRIES, timeout=TIMEOUT)
 
+        # DataDome pool (multi-value, smart inject)
+        self.dd_pool = DataDomePool(self.updater)
+
         # Combo manager + stats
         self.combo_manager = ComboManager(COMBO_FOLDER)
         self.combo_stats   = ComboStats()
@@ -1840,6 +2070,7 @@ class DataDomeBotEngine:
             combo_manager=self.combo_manager,
             combo_harvester=self.combo_harvester,
             combo_stats=self.combo_stats,
+            dd_pool=self.dd_pool,
         )
 
         # HTTP API
@@ -1904,6 +2135,13 @@ class DataDomeBotEngine:
 
         def worker_loop(thread_id):
             while not self.shutdown_event.is_set():
+                # ── Pause gate — workers wait here during /setdatadome inject ──
+                # inject() clears ready → workers park here → inject sets ready → resume
+                if not self.dd_pool.ready.is_set():
+                    self.dd_pool.ready.wait(timeout=60)  # max 60s wait, then resume anyway
+                    if self.shutdown_event.is_set():
+                        break
+
                 if DELAY_MS > 0:
                     self.shutdown_event.wait(timeout=DELAY_MS / 1000.0)
                     if self.shutdown_event.is_set():
@@ -1920,6 +2158,8 @@ class DataDomeBotEngine:
                     dd_short = dd[:30] + "..." if len(dd) > 30 else dd
                     update = self.updater.update_datadome(dd)
                     self.stats.record_fetch(True, result.get("latency_ms", 0), update.get("success", False))
+                    # Track success in pool
+                    self.dd_pool.record_success(dd)
 
                     if not BOT_MODE:
                         logger.debug(f"[BOT] ✔ {dd_short} | {result.get('latency_ms', 0)}ms | proxy: {result['proxy']}")
@@ -1933,6 +2173,10 @@ class DataDomeBotEngine:
                         )
                 else:
                     self.stats.record_fetch(False)
+                    # Track failure in pool (may retire expired DD)
+                    current_dd = self.dd_pool.get_best()
+                    if current_dd:
+                        self.dd_pool.record_failure(current_dd)
                     if not BOT_MODE:
                         logger.debug(f"[BOT] ✘ {result.get('error', '?')} | proxy: {result.get('proxy', '?')}")
 
