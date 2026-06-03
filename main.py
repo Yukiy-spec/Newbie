@@ -1144,8 +1144,8 @@ class TelegramBot:
         self._send_lock = threading.Lock()
         self._last_sent_at = 0.0          # timestamp of last sent message
         self._min_send_gap = 1.5          # seconds — Telegram allows ~1 msg/sec per bot
-        # Auto-notify gate: background worker messages use this separate timestamp
-        self._last_auto_notify = 0.0
+        # Auto-notify gate: start at now so first status fires after full interval, not at boot
+        self._last_auto_notify = time.time()
         self._auto_notify_lock = threading.Lock()
         if chat_id:
             self._allowed_chats.add(str(chat_id))
@@ -1933,7 +1933,6 @@ class TelegramBot:
             logger.info("[TG] No BOT_TOKEN set — Telegram bot disabled")
             return
         logger.info("[TG] Starting Telegram bot polling...")
-        self.send_important("🛡 DataDome Bot started! Use the buttons below to navigate.")
         while not shutdown_event.is_set():
             self.poll()
             shutdown_event.wait(1)
@@ -2305,6 +2304,15 @@ class DataDomeBotEngine:
         # Start Telegram polling in background thread
         tg_thread = threading.Thread(target=self.tg.run_polling, args=(self.shutdown_event,), daemon=True)
         tg_thread.start()
+
+        # Single startup message — wait briefly so polling is ready
+        time.sleep(1.5)
+        self.tg.send_important(
+            f"🛡 <b>DataDome Bot started!</b>\n\n"
+            f"🔄 Proxies: {self.scanner.total} | Workers: {NUM_WORKERS}\n"
+            f"🎯 Accounts: {self.combo_manager.total}\n\n"
+            f"Use the buttons below to navigate."
+        )
 
         # Wait for proxies if none loaded
         if self.scanner.total == 0:
