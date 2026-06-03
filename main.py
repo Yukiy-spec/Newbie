@@ -2269,13 +2269,14 @@ class DataDomeBotEngine:
         cycle_counter = [0]
         cycle_lock = threading.Lock()
         last_stats_log = [time.time()]
+        last_tg_notify  = [0.0]           # last time we sent a TG auto-update message
+        TG_NOTIFY_EVERY = 300             # seconds between auto Telegram messages (5 min)
 
         def worker_loop(thread_id):
             while not self.shutdown_event.is_set():
                 # ── Pause gate — workers wait here during /setdatadome inject ──
-                # inject() clears ready → workers park here → inject sets ready → resume
                 if not self.dd_pool.ready.is_set():
-                    self.dd_pool.ready.wait(timeout=60)  # max 60s wait, then resume anyway
+                    self.dd_pool.ready.wait(timeout=60)
                     if self.shutdown_event.is_set():
                         break
 
@@ -2288,35 +2289,39 @@ class DataDomeBotEngine:
 
                 with cycle_lock:
                     cycle_counter[0] += 1
-                    local_cycle = cycle_counter[0]
 
                 if result["success"]:
                     dd = result["datadome"]
                     dd_short = dd[:30] + "..." if len(dd) > 30 else dd
                     update = self.updater.update_datadome(dd)
                     self.stats.record_fetch(True, result.get("latency_ms", 0), update.get("success", False))
-                    # Track success in pool
                     self.dd_pool.record_success(dd)
 
                     if not BOT_MODE:
                         logger.debug(f"[BOT] ✔ {dd_short} | {result.get('latency_ms', 0)}ms | proxy: {result['proxy']}")
 
-                    if local_cycle % 100 == 0:
-                        stats = self.stats.get_stats()
-                        self.tg.send(
-                            f"🔄 DataDome auto-update #{stats['updated']}\n"
-                            f"Latency: {result.get('latency_ms', 0)}ms\n"
-                            f"Workers: {NUM_WORKERS} | Proxies: {self.scanner.total}"
-                        )
+                    # ── Time-gated TG notify — only 1 message per TG_NOTIFY_EVERY seconds ──
+                    now = time.time()
+                    if now - last_tg_notify[0] >= TG_NOTIFY_EVERY:
+                        with cycle_lock:
+                            if now - last_tg_notify[0] >= TG_NOTIFY_EVERY:
+                                last_tg_notify[0] = now
+                                stats = self.stats.get_stats()
+                                self.tg.send(
+                                    f"🔄 <b>DataDome Live</b>\n"
+                                    f"✔ Fetched: {stats['fetched']} | ↻ Updated: {stats['updated']}\n"
+                                    f"⚡ Avg: {stats.get('avg_latency_ms', 0)}ms\n"
+                                    f"🔄 Proxies: {self.scanner.total} | Workers: {NUM_WORKERS}"
+                                )
                 else:
                     self.stats.record_fetch(False)
-                    # Track failure in pool (may retire expired DD)
                     current_dd = self.dd_pool.get_best()
                     if current_dd:
                         self.dd_pool.record_failure(current_dd)
                     if not BOT_MODE:
                         logger.debug(f"[BOT] ✘ {result.get('error', '?')} | proxy: {result.get('proxy', '?')}")
 
+                # ── Console stats log every 30s (one thread wins the lock) ──
                 now = time.time()
                 if now - last_stats_log[0] > 30:
                     with cycle_lock:
