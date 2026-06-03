@@ -45,9 +45,9 @@ from concurrent.futures import ThreadPoolExecutor
 # ═══════════════════════════════════════════════════════════════
 BOT_TOKEN     = os.environ.get("BOT_TOKEN", "8642663150:AAE2taGFO5HS30aqTY1qyM71CtLmSHB4VCk")
 CHAT_ID       = os.environ.get("CHAT_ID", "5028065177")
-PROXY_FOLDER  = os.environ.get("PROXY_FOLDER", "/data/proxy")
-COMBO_FOLDER  = os.environ.get("COMBO_FOLDER", "/data/combo")
-COOKIE_FILE   = os.environ.get("COOKIE_FILE", "/data/full_cookie.txt")
+PROXY_FOLDER  = os.environ.get("PROXY_FOLDER", "./data/proxy")
+COMBO_FOLDER  = os.environ.get("COMBO_FOLDER", "./data/combo")
+COOKIE_FILE   = os.environ.get("COOKIE_FILE", "./data/full_cookie.txt")
 API_PORT      = int(os.environ.get("API_PORT", "8080"))
 MAX_RETRIES   = int(os.environ.get("MAX_RETRIES", "3"))
 TIMEOUT       = int(os.environ.get("TIMEOUT", "15000")) / 1000  # ms → seconds — residential proxies need more time
@@ -521,8 +521,15 @@ class CookieUpdater:
 
     def read_full_cookie(self):
         """Read the full cookie — returns the line with the most fields (most ';'-separated parts).
-        Bare datadome-only lines (single field, no other cookies) are skipped."""
+
+        Rules:
+        - Bare datadome-only lines (1 field) are skipped — useless by themselves
+        - Returns the richest line (most ';' fields) so the request looks like a real browser
+        - If the file is missing or empty, logs a warning and returns None so callers can fallback
+        """
         if not os.path.exists(self.filepath):
+            logger.warning(f"[COOKIE] full_cookie.txt not found at {self.filepath} — "
+                           f"set the COOKIE env var on Railway or use /cookieset")
             return None
         try:
             best_line = None
@@ -530,17 +537,22 @@ class CookieUpdater:
             with open(self.filepath, "r") as f:
                 for line in f:
                     stripped = line.strip()
-                    if not stripped:
+                    if not stripped or stripped.startswith("#"):
                         continue
                     fields = [p.strip() for p in stripped.split(";") if p.strip()]
-                    # Skip bare datadome-only lines
+                    # Skip bare datadome-only lines — not useful as a full cookie
                     if len(fields) == 1 and fields[0].lower().startswith("datadome="):
                         continue
                     if len(fields) > best_count:
                         best_count = len(fields)
                         best_line = stripped
+            if best_line is None:
+                logger.warning(f"[COOKIE] No full cookie line found in {self.filepath} — "
+                               f"only bare datadome= lines present or file is empty. "
+                               f"Update with /cookieset or set COOKIE env var.")
             return best_line
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[COOKIE] Error reading {self.filepath}: {e}")
             return None
 
     def write_cookie(self, cookie_string):
@@ -767,6 +779,12 @@ def _harvest_prelogin(account, proxy_dict, updater=None):
                         f"datadome={fresh_dd[:20]}..."
                     )
                 elif fresh_dd:
+                    # full_cookie.txt missing or empty — fallback to datadome= only
+                    # Fix: set the COOKIE env var on Railway with your full cookie string
+                    logger.warning(
+                        f"[COMBO] ⚠ Full cookie not available for 403-retry ({username}) — "
+                        f"falling back to datadome= only. Set COOKIE env var on Railway!"
+                    )
                     headers["cookie"] = f"datadome={fresh_dd}"
                     sess.cookies.set("datadome", fresh_dd, domain=".garena.com")
 
@@ -1098,6 +1116,9 @@ class TelegramBot:
                     {"text": "📤 Upload Proxy",   "callback_data": "cmd_uploadproxy"},
                     {"text": "📤 Upload Combo",   "callback_data": "cmd_uploadcombo"},
                 ],
+                [
+                    {"text": "💉 Set DataDome",   "callback_data": "cmd_setdatadome"},
+                ],
             ]
         }
 
@@ -1181,6 +1202,7 @@ class TelegramBot:
             "cmd_combostats":   self._do_combostats,
             "cmd_uploadproxy":  lambda cid, **kw: self._start_upload(cid, "proxy"),
             "cmd_uploadcombo":  lambda cid, **kw: self._start_upload(cid, "combo"),
+            "cmd_setdatadome":  self._do_setdatadome_prompt,
         }
         handler = cmd_map.get(data)
         if handler:
@@ -1319,6 +1341,39 @@ class TelegramBot:
                 self.updater.write_cookie(cookie_str)
                 self.send(f"✅ Cookie file updated\n\n<code>{cookie_str}</code>", chat_id)
 
+        elif cmd == "/setdatadome":
+            if not args:
+                self.send(
+                    "💉 <b>Set Fresh DataDome</b>\n\n"
+                    "Usage: /setdatadome [fresh datadome value]\n\n"
+                    "Example:\n<code>/setdatadome AHrlqAAAAAA...</code>\n\n"
+                    "Awtomatiko itong ilalagay sa full cookie file — lahat ng ibang fields (sso_key, PHPSESSID, etc.) ay hindi maaapektuhan.",
+                    chat_id
+                )
+            else:
+                fresh_dd = args[0].strip()
+                # Strip datadome= prefix kung nakapaste yung buong field
+                if fresh_dd.lower().startswith("datadome="):
+                    fresh_dd = fresh_dd.split("=", 1)[1].strip()
+                result = self.updater.update_datadome(fresh_dd)
+                if result.get("success"):
+                    full = self.updater.read_full_cookie()
+                    preview = (full[:80] + "...") if full and len(full) > 80 else (full or "N/A")
+                    self.send(
+                        f"✅ <b>DataDome updated!</b>\n\n"
+                        f"🆕 New value:\n<code>{fresh_dd[:40]}...</code>\n\n"
+                        f"🍪 Full cookie preview:\n<code>{preview}</code>",
+                        chat_id
+                    )
+                else:
+                    err = result.get("error", "unknown error")
+                    self.send(
+                        f"❌ <b>Failed to update DataDome</b>\n\n"
+                        f"Error: {err}\n\n"
+                        f"Baka walang full cookie file pa — i-set muna ang buong cookie gamit ang /cookieset",
+                        chat_id
+                    )
+
     # ── Command handlers (shared by text commands & button callbacks) ──
 
     def _do_start(self, chat_id, **_):
@@ -1332,7 +1387,7 @@ class TelegramBot:
             "<b>🎯 Combo Harvest</b>\n"
             "/combolist /combodel /uploadcombo /harvest /harveststop /combostats\n\n"
             "<b>⚙️ Cookie</b>\n"
-            "/cookieset",
+            "/cookieset /setdatadome",
             chat_id
         )
 
@@ -1395,6 +1450,20 @@ class TelegramBot:
     def _do_cookie(self, chat_id, message_id=None, **_):
         content = self.updater.read_full_cookie()
         text = f"🍪 <b>Full Cookie:</b>\n\n<code>{content}</code>" if content else "❌ No cookie file found"
+        if message_id:
+            self.edit_message(chat_id, message_id, text)
+        else:
+            self.send(text, chat_id)
+
+    def _do_setdatadome_prompt(self, chat_id, message_id=None, **_):
+        """Button press — prompt user to send /setdatadome command."""
+        text = (
+            "💉 <b>Set Fresh DataDome</b>\n\n"
+            "I-type ang command na ito tapos i-paste ang fresh datadome value mo:\n\n"
+            "<code>/setdatadome PASTE_FRESH_VALUE_DITO</code>\n\n"
+            "Awtomatiko itong ilalagay sa full cookie — lahat ng ibang fields ay hindi maaapektuhan.\n\n"
+            "Pagkatapos, gumagana na ulit ang bot agad! ✅"
+        )
         if message_id:
             self.edit_message(chat_id, message_id, text)
         else:
@@ -1940,10 +2009,11 @@ def main():
 
     cookie_env = os.environ.get("COOKIE", "").strip()
     if cookie_env:
-        if not os.path.exists(COOKIE_FILE):
-            with open(COOKIE_FILE, "w") as f:
-                f.write(cookie_env + "\n")
-            logger.info(f"[BOT] Wrote cookie from COOKIE env")
+        # Always overwrite — so updating the COOKIE env var on Railway
+        # immediately takes effect on next deploy/restart
+        with open(COOKIE_FILE, "w") as f:
+            f.write(cookie_env + "\n")
+        logger.info(f"[BOT] Wrote cookie from COOKIE env → {COOKIE_FILE}")
 
     _engine = DataDomeBotEngine()
     _engine.run()
