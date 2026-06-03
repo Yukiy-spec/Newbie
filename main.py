@@ -1140,13 +1140,21 @@ class TelegramBot:
         self._lock = threading.Lock()
         self._allowed_chats = set()
         self._pending_file = {}   # {chat_id: ("proxy"|"combo", filename|"__upload__")}
-        # Rate-limit: enforces a minimum gap between outgoing messages
-        self._send_lock = threading.Lock()
-        self._last_sent_at = 0.0          # timestamp of last sent message
-        self._min_send_gap = 1.5          # seconds — Telegram allows ~1 msg/sec per bot
-        # Auto-notify gate: start at now so first status fires after full interval, not at boot
+
+        # ── Single-sender architecture ────────────────────────────────────────────
+        # ONE background thread drains a queue. All send calls just enqueue a dict.
+        # This makes concurrent sends physically impossible — the queue is FIFO and
+        # only 1 thread reads from it.
+        import queue as _queue
+        self._outbox = _queue.Queue()
+        self._sender_thread = threading.Thread(target=self._sender_worker, daemon=True)
+        self._sender_thread.start()
+
+        # Auto-notify gate: start timestamp = now, so first auto-notify fires after
+        # the full AUTO_NOTIFY_INTERVAL — not immediately at boot.
         self._last_auto_notify = time.time()
         self._auto_notify_lock = threading.Lock()
+
         if chat_id:
             self._allowed_chats.add(str(chat_id))
 
@@ -1186,66 +1194,58 @@ class TelegramBot:
             ]
         }
 
-    def send(self, text, chat_id=None, parse_mode="HTML", menu=True):
-        """Send a message — thread-safe, rate-limited.
-
-        Non-blocking acquire: if another thread is already sending, this call
-        is dropped immediately so workers never pile up a backlog of messages.
+    def _sender_worker(self):
+        """Single background thread that drains _outbox.
+        This is the ONLY place that calls the Telegram sendMessage API.
+        One thread = zero concurrent sends = zero spam, guaranteed.
         """
+        import queue as _queue
+        while True:
+            try:
+                payload = self._outbox.get(timeout=5)
+            except _queue.Empty:
+                continue
+            try:
+                requests.post(
+                    f"{self.API_BASE}{self.token}/sendMessage",
+                    json=payload, timeout=10
+                )
+            except Exception:
+                pass
+            time.sleep(1.0)   # Telegram allows max ~1 msg/sec per bot
+
+    def _enqueue(self, text, chat_id=None, parse_mode="HTML", menu=True):
+        """Build payload and put it in the outbox. Never blocks, never sends directly."""
         cid = chat_id or self.chat_id
         if not self.token or not cid:
             return
-        if not self._send_lock.acquire(blocking=False):
-            return  # another thread is sending right now — drop this one
-        try:
-            now = time.time()
-            if now - self._last_sent_at < self._min_send_gap:
-                return  # too soon since last message — drop silently
-            self._last_sent_at = now
-            payload = {"chat_id": cid, "text": text, "parse_mode": parse_mode}
-            if menu:
-                payload["reply_markup"] = self._main_menu()
-            try:
-                requests.post(f"{self.API_BASE}{self.token}/sendMessage",
-                              json=payload, timeout=10)
-            except Exception:
-                pass
-        finally:
-            self._send_lock.release()
+        payload = {"chat_id": cid, "text": text, "parse_mode": parse_mode}
+        if menu:
+            payload["reply_markup"] = self._main_menu()
+        self._outbox.put(payload)
+
+    def send(self, text, chat_id=None, parse_mode="HTML", menu=True):
+        """Enqueue a message. Non-blocking — just adds to the outbox queue."""
+        self._enqueue(text, chat_id, parse_mode, menu)
 
     def send_important(self, text, chat_id=None, parse_mode="HTML", menu=True):
-        """Like send() but guaranteed delivery — waits for rate-limit gap instead
-        of dropping.  Use for one-time events: startup, shutdown, command replies.
-        """
-        cid = chat_id or self.chat_id
-        if not self.token or not cid:
-            return
-        with self._send_lock:
-            wait = self._min_send_gap - (time.time() - self._last_sent_at)
-            if wait > 0:
-                time.sleep(wait)
-            self._last_sent_at = time.time()
-            payload = {"chat_id": cid, "text": text, "parse_mode": parse_mode}
-            if menu:
-                payload["reply_markup"] = self._main_menu()
-            try:
-                requests.post(f"{self.API_BASE}{self.token}/sendMessage",
-                              json=payload, timeout=10)
-            except Exception:
-                pass
+        """Alias for send() — kept for compatibility. All sends go through the same queue."""
+        self._enqueue(text, chat_id, parse_mode, menu)
 
     def auto_notify(self, text):
-        """Background status update — fires at most once per AUTO_NOTIFY_INTERVAL
-        seconds no matter how many threads call it simultaneously.
+        """Background status update — enqueues at most once per AUTO_NOTIFY_INTERVAL.
+        Safe to call from all 20 workers simultaneously; only 1 message ever gets queued.
         """
         now = time.time()
+        # Fast path — no lock needed for the common case (interval not yet elapsed)
         if now - self._last_auto_notify < self.AUTO_NOTIFY_INTERVAL:
             return
         with self._auto_notify_lock:
+            # Re-check inside lock — only 1 thread wins
             if now - self._last_auto_notify < self.AUTO_NOTIFY_INTERVAL:
-                return  # another thread already won the race
-            self._last_auto_notify = now
-        self.send_important(text)  # send outside the lock
+                return
+            self._last_auto_notify = now   # claim the slot before releasing lock
+        self._enqueue(text)                # enqueue outside lock — non-blocking
 
     def answer_callback(self, callback_query_id, text=""):
         """Answer a callback query (clears the loading spinner)."""
