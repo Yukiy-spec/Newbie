@@ -433,17 +433,28 @@ class CookieUpdater:
         self._lines_cache: list[str] = []
         self._load_cache()
 
+    # Maximum cookie lines to keep in memory and on disk
+    MAX_COOKIE_LINES = 500
+
     def _load_cache(self):
-        """Load all non-empty, non-comment cookie lines into memory."""
+        """Load all non-empty, non-comment cookie lines into memory — capped at MAX_COOKIE_LINES."""
         if not os.path.exists(self.filepath):
             self._lines_cache = []
             return
         try:
+            all_lines = []
             with open(self.filepath, "r") as f:
-                self._lines_cache = [
-                    l.strip() for l in f
-                    if l.strip() and not l.strip().startswith("#")
-                ]
+                for line in f:
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("#"):
+                        all_lines.append(stripped)
+            total = len(all_lines)
+            self._lines_cache = all_lines[:self.MAX_COOKIE_LINES]
+            if total > self.MAX_COOKIE_LINES:
+                logger.info(
+                    f"[COOKIE] Auto-cut cookie file: {total} lines → {self.MAX_COOKIE_LINES} "
+                    f"(trimmed {total - self.MAX_COOKIE_LINES})"
+                )
         except Exception as e:
             logger.warning(f"[COOKIE] Error loading cache: {e}")
             self._lines_cache = []
@@ -586,19 +597,24 @@ class CookieUpdater:
             return list(self._lines_cache)
 
     def write_cookie(self, cookie_string: str):
-        """Write/overwrite the cookie file.
+        """Write/overwrite the cookie file — capped at MAX_COOKIE_LINES.
 
         Supports multi-line input (one cookie per line) or single line.
+        Any lines beyond MAX_COOKIE_LINES are silently dropped.
         """
         dirpath = os.path.dirname(self.filepath)
         if dirpath:
             os.makedirs(dirpath, exist_ok=True)
         with self._lock:
-            lines = [l.strip() for l in cookie_string.strip().splitlines() if l.strip()]
+            all_lines = [l.strip() for l in cookie_string.strip().splitlines() if l.strip()]
+            lines = all_lines[:self.MAX_COOKIE_LINES]
+            trimmed = len(all_lines) - len(lines)
             with open(self.filepath, "w") as f:
                 for line in lines:
                     f.write(line + "\n")
             self._lines_cache = lines
+        if trimmed:
+            logger.info(f"[COOKIE] write_cookie: trimmed {trimmed} lines beyond limit ({self.MAX_COOKIE_LINES} kept)")
         logger.info(f"[COOKIE] Wrote {len(lines)} cookie line(s) to {self.filepath}")
 
 
