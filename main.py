@@ -1438,9 +1438,9 @@ class TelegramBot:
             "cmd_harvest":      self._do_harvest,
             "cmd_harveststop":  self._do_harveststop,
             "cmd_combostats":   self._do_combostats,
-            "cmd_uploadproxy":  lambda cid, **kw: self._start_upload(cid, "proxy"),
-            "cmd_uploadcombo":  lambda cid, **kw: self._start_upload(cid, "combo"),
-            "cmd_uploadcookie": lambda cid, **kw: self._start_upload(cid, "cookie"),
+            "cmd_uploadproxy":  lambda cid, **kw: self._start_upload(cid, "proxy", message_id=kw.get("message_id")),
+            "cmd_uploadcombo":  lambda cid, **kw: self._start_upload(cid, "combo", message_id=kw.get("message_id")),
+            "cmd_uploadcookie": lambda cid, **kw: self._start_upload(cid, "cookie", message_id=kw.get("message_id")),
             "cmd_setdatadome":  self._do_setdatadome_prompt,
             "cmd_renewcookie":  self._do_renewcookie,
             "cmd_cookiebatches": self._do_cookiebatches,
@@ -1699,8 +1699,8 @@ class TelegramBot:
 
     # ── Command handlers (shared by text commands & button callbacks) ──
 
-    def _do_start(self, chat_id, **_):
-        self.send_important(
+    def _do_start(self, chat_id, message_id=None, **_):
+        text = (
             "🛡 <b>DataDome Bot</b>\n\n"
             "Use the buttons below to navigate, or type commands:\n\n"
             "<b>📡 Monitoring</b>\n"
@@ -1710,9 +1710,12 @@ class TelegramBot:
             "<b>🎯 Combo Harvest</b>\n"
             "/combolist /combodel /uploadcombo /harvest /harveststop /combostats\n\n"
             "<b>⚙️ Cookie</b>\n"
-            "/cookieset /setdatadome /renewcookie /cookiebatches",
-            chat_id
+            "/cookieset /setdatadome /renewcookie /cookiebatches"
         )
+        if message_id:
+            self.edit_message(chat_id, message_id, text)
+        else:
+            self.send_important(text, chat_id)
 
     def _do_status(self, chat_id, message_id=None, **_):
         stats   = self.stats.get_stats()
@@ -1892,39 +1895,40 @@ class TelegramBot:
         else:
             self.send_important(text, chat_id)
 
-    def _start_upload(self, chat_id, kind="proxy", **_):
+    def _start_upload(self, chat_id, kind="proxy", message_id=None, **_):
         """Set pending upload state and prompt user."""
         self._pending_file[chat_id] = (kind, "__upload__")
         if kind == "cookie":
-            self.send_important(
+            text = (
                 "📤 <b>Upload Cookie File</b>\n\n"
                 "I-send ang <code>.txt</code> file na may full cookies.\n"
                 "One complete cookie string per line (lahat ng fields):\n\n"
                 "<code>datadome=xxx; sso_key=yyy; PHPSESSID=zzz; ...</code>\n\n"
                 "Puwede 1 line o hanggang 500+ lines — lahat ay awtomatikong\n"
-                "maa-update ng fresh datadome every fetch cycle. ✅",
-                chat_id
+                "maa-update ng fresh datadome every fetch cycle. ✅"
             )
         elif kind == "combo":
-            self.send_important(
+            text = (
                 "📤 <b>Upload Combo File</b>\n\n"
                 "Send a <code>.txt</code> file with accounts.\n"
                 "Formats accepted (one per line):\n"
                 "• <code>username</code>\n"
                 "• <code>username:password</code>\n"
-                "• <code>email@example.com:password</code>",
-                chat_id
+                "• <code>email@example.com:password</code>"
             )
         else:
-            self.send_important(
+            text = (
                 "📤 <b>Upload Proxy File</b>\n\n"
                 "Send a <code>.txt</code> file with proxies.\n"
                 "Formats accepted (one per line):\n"
                 "• <code>ip:port</code>\n"
                 "• <code>ip:port:user:pass</code>\n"
-                "• <code>http://user:pass@ip:port</code>",
-                chat_id
+                "• <code>http://user:pass@ip:port</code>"
             )
+        if message_id:
+            self.edit_message(chat_id, message_id, text)
+        else:
+            self.send_important(text, chat_id)
 
     # ── File upload handlers ────────────────────────────────────────
 
@@ -2507,62 +2511,10 @@ class DataDomeBotEngine:
         if self.shutdown_event.is_set():
             return
 
-        # Main fetch loop — 20 parallel workers
-        logger.info(f"[BOT] 🚀 Starting {NUM_WORKERS}-worker parallel fetch loop...")
-        cycle_counter = [0]
-        cycle_lock = threading.Lock()
-        last_stats_log = [time.time()]
-
-        def worker_loop(thread_id):
-            while not self.shutdown_event.is_set():
-                # ── Pause gate — workers wait here during /setdatadome inject ──
-                if not self.dd_pool.ready.is_set():
-                    self.dd_pool.ready.wait(timeout=60)
-                    if self.shutdown_event.is_set():
-                        break
-
-                if DELAY_MS > 0:
-                    self.shutdown_event.wait(timeout=DELAY_MS / 1000.0)
-                    if self.shutdown_event.is_set():
-                        break
-
-                result = self.fetcher.fetch(thread_id=thread_id)
-
-                with cycle_lock:
-                    cycle_counter[0] += 1
-
-                if result["success"]:
-                    dd = result["datadome"]
-                    dd_short = dd[:30] + "..." if len(dd) > 30 else dd
-                    update = self.updater.update_datadome(dd)
-                    self.stats.record_fetch(True, result.get("latency_ms", 0), update.get("success", False))
-                    self.dd_pool.record_success(dd)
-
-                    if not BOT_MODE:
-                        logger.debug(f"[BOT] ✔ {dd_short} | {result.get('latency_ms', 0)}ms | proxy: {result['proxy']}")
-                else:
-                    self.stats.record_fetch(False)
-                    current_dd = self.dd_pool.get_best()
-                    if current_dd:
-                        self.dd_pool.record_failure(current_dd)
-                    if not BOT_MODE:
-                        logger.debug(f"[BOT] ✘ {result.get('error', '?')} | proxy: {result.get('proxy', '?')}")
-
-                # ── Console stats log every 30s (one thread wins the lock) ──
-                now = time.time()
-                if now - last_stats_log[0] > 30:
-                    with cycle_lock:
-                        if now - last_stats_log[0] > 30:
-                            last_stats_log[0] = now
-                            s = self.stats.get_stats()
-                            logger.info(
-                                f"[BOT] 📊 {s['fetched']} fetched | {s['updated']} updated | "
-                                f"{s['failed']} failed | avg: {s['avg_latency_ms']}ms"
-                            )
-
-        with ThreadPoolExecutor(max_workers=NUM_WORKERS, thread_name_prefix="ddworker") as pool:
-            futures = [pool.submit(worker_loop, i) for i in range(NUM_WORKERS)]
-            self.shutdown_event.wait()
+        # ── Auto-fetch loop DISABLED — manual mode only ──
+        # DataDome fetch starts only when ▶️ Harvest button is pressed.
+        logger.info("[BOT] ⏸ Manual mode — waiting for Harvest command via Telegram...")
+        self.shutdown_event.wait()
 
         # Shutdown
         logger.info("[BOT] ⚠ Shutting down...")
