@@ -425,6 +425,19 @@ class CookieUpdater:
             for line in lines:
                 stripped = line.rstrip("\n")
                 if "datadome=" in stripped:
+                    # Count non-empty fields (split by ';', ignore empty/whitespace parts)
+                    fields = [p.strip() for p in stripped.split(";") if p.strip()]
+                    is_datadome_only = (len(fields) == 1)
+
+                    if is_datadome_only:
+                        # Auto-delete bare datadome-only lines — they have no value
+                        m = _re.search(r'datadome=([^;]*)', stripped)
+                        if m and old_value is None:
+                            old_value = m.group(1).strip()
+                        lines_changed += 1
+                        # Drop this line entirely (don't append to new_lines)
+                        continue
+
                     # Capture old value on first hit
                     m = _re.search(r'datadome=([^;]*)', stripped)
                     if m and old_value is None:
@@ -486,12 +499,26 @@ class CookieUpdater:
         return None
 
     def read_full_cookie(self):
-        """Read the full cookie file content."""
+        """Read the full cookie — returns the line with the most fields (most ';'-separated parts).
+        Bare datadome-only lines (single field, no other cookies) are skipped."""
         if not os.path.exists(self.filepath):
             return None
         try:
+            best_line = None
+            best_count = 0
             with open(self.filepath, "r") as f:
-                return f.read().strip()
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    fields = [p.strip() for p in stripped.split(";") if p.strip()]
+                    # Skip bare datadome-only lines
+                    if len(fields) == 1 and fields[0].lower().startswith("datadome="):
+                        continue
+                    if len(fields) > best_count:
+                        best_count = len(fields)
+                        best_line = stripped
+            return best_line
         except Exception:
             return None
 
@@ -624,8 +651,6 @@ class ComboManager:
 #  and REPLACE the old datadome in the cookie file (same as
 #  update_datadome() does for the DD fetch loop).
 # ═══════════════════════════════════════════════════════════════
-import cloudscraper as _cloudscraper
-
 _combo_thread_local = threading.local()
 _combo_session_lock = threading.Lock()
 
@@ -633,6 +658,10 @@ _combo_session_lock = threading.Lock()
 def _get_combo_session(proxy_dict):
     """Get or create a per-thread cloudscraper session for combo harvesting."""
     if not hasattr(_combo_thread_local, "session"):
+        try:
+            import cloudscraper as _cloudscraper
+        except ImportError:
+            raise RuntimeError("cloudscraper not installed. Run: pip install cloudscraper")
         with _combo_session_lock:
             time.sleep(random.uniform(0.05, 0.2))
         sess = _cloudscraper.create_scraper()
@@ -642,10 +671,15 @@ def _get_combo_session(proxy_dict):
     return _combo_thread_local.session
 
 
-def _harvest_prelogin(account, proxy_dict):
+def _harvest_prelogin(account, proxy_dict, updater=None):
     """
     Hit prelogin for `account`. Returns fresh datadome value or None.
     Garena returns Set-Cookie datadome before checking the password.
+
+    On 403:
+      1. Load the FULL cookie (richest line — all fields like sso_key, PHPSESSID, etc.)
+      2. Inject the latest fresh datadome into that full cookie string before sending
+      3. Retry with the full cookie in the Cookie header
     """
     url = "https://sso.garena.com/api/prelogin"
     username = account.split(":")[0].strip()
@@ -680,9 +714,40 @@ def _harvest_prelogin(account, proxy_dict):
             "sec-fetch-site": "same-origin",
             "user-agent": ua,
         }
-        dd = sess.cookies.get("datadome")
-        if dd:
-            headers["cookie"] = f"datadome={dd}"
+
+        # Normal attempt (attempt 0): use just datadome from session/cookie file
+        # 403 retry (attempt >= 1): use FULL cookie with latest fresh datadome injected
+        if attempt == 0:
+            dd = sess.cookies.get("datadome")
+            if not dd and updater:
+                dd = updater.read_current_datadome()
+                if dd:
+                    sess.cookies.set("datadome", dd, domain=".garena.com")
+            if dd:
+                headers["cookie"] = f"datadome={dd}"
+        else:
+            # Use full cookie — inject latest fresh datadome into it
+            if updater:
+                full_cookie = updater.read_full_cookie()
+                fresh_dd = updater.read_current_datadome()
+                if full_cookie and fresh_dd:
+                    # Replace datadome value in the full cookie string with the freshest one
+                    full_cookie_updated = _re.sub(
+                        r'datadome=[^;]*',
+                        f'datadome={fresh_dd}',
+                        full_cookie
+                    )
+                    headers["cookie"] = full_cookie_updated
+                    # Also seed the session so subsequent requests stay consistent
+                    sess.cookies.set("datadome", fresh_dd, domain=".garena.com")
+                    logger.debug(
+                        f"[COMBO] 403-retry {attempt} for {username} — "
+                        f"full cookie ({len(full_cookie_updated)} chars), "
+                        f"datadome={fresh_dd[:20]}..."
+                    )
+                elif fresh_dd:
+                    headers["cookie"] = f"datadome={fresh_dd}"
+                    sess.cookies.set("datadome", fresh_dd, domain=".garena.com")
 
         time.sleep(random.uniform(0.1, 0.4))
         try:
@@ -707,11 +772,11 @@ def _harvest_prelogin(account, proxy_dict):
                 return dd_resp
 
             if resp.status_code == 403:
-                # Rotate proxy and retry
-                if proxy_dict:
-                    # re-seed session with new proxy next attempt
-                    if hasattr(_combo_thread_local, "session"):
-                        del _combo_thread_local.session
+                logger.debug(f"[COMBO] 403 on {username} (attempt {attempt+1}) — switching to full cookie on next retry")
+                # Drop stale session — next attempt will use full cookie with fresh datadome
+                if hasattr(_combo_thread_local, "session"):
+                    del _combo_thread_local.session
+                sess = _get_combo_session(proxy_dict)
                 time.sleep(random.uniform(0.5, 1.5))
                 continue
 
@@ -774,14 +839,13 @@ class ComboHarvester:
             self._running = False
             return
 
-        logger.info(f"[COMBO] Starting harvester: {len(accounts)} accounts, {threads} threads")
-        self.stats.reset(len(accounts))
+        logger.info(f"[COMBO] Starting infinite harvester: {len(accounts)} accounts, {threads} threads")
 
         def worker(account):
             if self._stop_event.is_set():
                 return
             proxy_dict, _ = self.scanner.get_next()
-            dd = _harvest_prelogin(account, proxy_dict)
+            dd = _harvest_prelogin(account, proxy_dict, updater=self.updater)
             if dd:
                 result = self.updater.update_datadome(dd)
                 if result.get("success"):
@@ -793,18 +857,39 @@ class ComboHarvester:
                 self.stats.record(hit=False, updated=False)
 
         from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
+
+        cycle = 0
         with _TPE(max_workers=threads, thread_name_prefix="combo") as pool:
-            futures = {pool.submit(worker, acc): acc for acc in accounts}
-            for fut in _ac(futures):
-                if self._stop_event.is_set():
-                    break
-                try:
-                    fut.result()
-                except Exception as e:
-                    logger.debug(f"[COMBO] worker error: {e}")
+            while not self._stop_event.is_set():
+                cycle += 1
+                # Re-fetch accounts each cycle so new uploads are picked up
+                accounts = self.combo_manager.get_all()
+                if not accounts:
+                    logger.warning("[COMBO] No accounts — waiting 5s...")
+                    self._stop_event.wait(5)
+                    continue
+
+                self.stats.reset(len(accounts))
+                logger.info(f"[COMBO] Cycle #{cycle} — {len(accounts)} accounts")
+
+                futures = {pool.submit(worker, acc): acc for acc in accounts}
+                for fut in _ac(futures):
+                    if self._stop_event.is_set():
+                        break
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        logger.debug(f"[COMBO] worker error: {e}")
+
+                if not self._stop_event.is_set():
+                    s = self.stats.get()
+                    logger.info(
+                        f"[COMBO] Cycle #{cycle} done — "
+                        f"hits: {s['hits']}, updated: {s['updated']}, misses: {s['misses']} — looping..."
+                    )
 
         self._running = False
-        logger.info(f"[COMBO] Harvester finished — {self.stats.get()}")
+        logger.info(f"[COMBO] Harvester stopped after {cycle} cycle(s) — {self.stats.get()}")
 
 
 class ComboStats:
@@ -1080,8 +1165,8 @@ class TelegramBot:
             "cmd_harvest":      self._do_harvest,
             "cmd_harveststop":  self._do_harveststop,
             "cmd_combostats":   self._do_combostats,
-            "cmd_uploadproxy":  lambda cid: self._start_upload(cid, "proxy"),
-            "cmd_uploadcombo":  lambda cid: self._start_upload(cid, "combo"),
+            "cmd_uploadproxy":  lambda cid, **kw: self._start_upload(cid, "proxy"),
+            "cmd_uploadcombo":  lambda cid, **kw: self._start_upload(cid, "combo"),
         }
         handler = cmd_map.get(data)
         if handler:
@@ -1513,14 +1598,14 @@ class APIHandler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
 
         if path == "/" or path == "/datadome":
-            # Raw datadome value (plain text)
+            # Raw datadome value (plain text) — 5000 char limit
             dd = self._updater.read_current_datadome() if self._updater else None
-            self._text_response(dd or "NONE")
+            self._text_response((dd or "NONE")[:5000])
 
         elif path == "/cookie":
-            # Full cookie string
+            # Full cookie — richest line (most fields), 5000 char limit
             content = self._updater.read_full_cookie() if self._updater else None
-            self._text_response(content or "NONE")
+            self._text_response((content or "NONE")[:5000])
 
         elif path == "/stats":
             # JSON stats
