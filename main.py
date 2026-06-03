@@ -48,6 +48,7 @@ CHAT_ID       = os.environ.get("CHAT_ID", "5028065177")
 PROXY_FOLDER  = os.environ.get("PROXY_FOLDER", "./data/proxy")
 COMBO_FOLDER  = os.environ.get("COMBO_FOLDER", "./data/combo")
 COOKIE_FILE   = os.environ.get("COOKIE_FILE", "./data/full_cookie.txt")
+COOKIE_FOLDER = os.environ.get("COOKIE_FOLDER", "./data/cookies")  # folder for batch cookie files
 API_PORT      = int(os.environ.get("API_PORT", "8080"))
 MAX_RETRIES   = int(os.environ.get("MAX_RETRIES", "3"))
 TIMEOUT       = int(os.environ.get("TIMEOUT", "15000")) / 1000  # ms → seconds — residential proxies need more time
@@ -426,11 +427,13 @@ class CookieUpdater:
     /cookie API endpoint streams all lines so external tools always see fresh values.
     """
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, cookie_folder=None):
         self.filepath = filepath
+        self.cookie_folder = cookie_folder or COOKIE_FOLDER
         self._lock = threading.Lock()
-        # In-memory cache of all cookie lines — updated atomically on each write
         self._lines_cache: list[str] = []
+        self._current_batch_file: str | None = None
+        os.makedirs(self.cookie_folder, exist_ok=True)
         self._load_cache()
 
     # Maximum cookie lines to keep in memory and on disk
@@ -458,6 +461,105 @@ class CookieUpdater:
         except Exception as e:
             logger.warning(f"[COOKIE] Error loading cache: {e}")
             self._lines_cache = []
+
+    # ── Multi-file cookie rotation ────────────────────────────────────────────
+    def list_cookie_files(self) -> list[str]:
+        """Return sorted list of .txt files in cookie_folder (next batches)."""
+        if not os.path.isdir(self.cookie_folder):
+            return []
+        active_name = os.path.basename(self.filepath)
+        return sorted([
+            f for f in os.listdir(self.cookie_folder)
+            if f.lower().endswith(".txt") and f != active_name
+        ])
+
+    def renew_cookie(self) -> dict:
+        """Load the next cookie batch from cookie_folder into the active file.
+
+        - Takes the first (alphabetically) .txt in cookie_folder
+        - Copies its contents into full_cookie.txt (replaces current active)
+        - Deletes it from the folder so it won't be reused
+        - Reloads the in-memory cache
+
+        Returns dict with success, file, lines, remaining, message.
+        """
+        with self._lock:
+            files = self.list_cookie_files()
+            if not files:
+                msg = "❌ Walang natitira pang cookie batch sa folder.\nMag-upload ng bago gamit ang Upload Cookies."
+                logger.warning("[COOKIE] renew_cookie: no batch files available")
+                return {"success": False, "file": None, "lines": 0, "remaining": 0, "message": msg}
+
+            next_file = files[0]
+            next_path = os.path.join(self.cookie_folder, next_file)
+
+            try:
+                with open(next_path, "r", encoding="utf-8", errors="ignore") as f:
+                    raw = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+
+                if not raw:
+                    os.remove(next_path)
+                    remaining = len(files) - 1
+                    return {"success": False, "file": next_file, "lines": 0,
+                            "remaining": remaining,
+                            "message": f"⚠️ {next_file} walang laman — nilaktawan. May {remaining} batch pa."}
+
+                batch = raw[:self.MAX_COOKIE_LINES]
+
+                # Overwrite active cookie file
+                dirpath = os.path.dirname(self.filepath)
+                if dirpath:
+                    os.makedirs(dirpath, exist_ok=True)
+                with open(self.filepath, "w", encoding="utf-8") as f:
+                    for line in batch:
+                        f.write(line + "\n")
+
+                self._lines_cache = batch
+                self._current_batch_file = next_file
+
+                # Remove used file from rotation
+                os.remove(next_path)
+                remaining = len(files) - 1
+
+                logger.info(f"[COOKIE] 🔄 Renewed → {next_file} ({len(batch)} lines) | {remaining} batch(es) left")
+                msg = (f"🔄 <b>Cookie Renewed!</b>\n\n"
+                       f"📄 File: <b>{next_file}</b>\n"
+                       f"✅ Lines loaded: <b>{len(batch)}</b>\n"
+                       f"📦 Remaining batches: <b>{remaining}</b>")
+                return {"success": True, "file": next_file, "lines": len(batch),
+                        "remaining": remaining, "message": msg}
+
+            except Exception as e:
+                logger.warning(f"[COOKIE] renew_cookie error: {e}")
+                return {"success": False, "file": next_file, "lines": 0,
+                        "remaining": len(files) - 1, "message": f"❌ Error: {e}"}
+
+    def add_cookie_batch(self, filename: str, lines: list[str]) -> dict:
+        """Save a new .txt file into cookie_folder for future /renewcookie use."""
+        os.makedirs(self.cookie_folder, exist_ok=True)
+        safe = filename if filename.lower().endswith(".txt") else filename + ".txt"
+        if safe == os.path.basename(self.filepath):
+            safe = "batch_" + safe
+        fpath = os.path.join(self.cookie_folder, safe)
+        valid = [l.strip() for l in lines if l.strip() and not l.strip().startswith("#")]
+        with open(fpath, "w", encoding="utf-8") as f:
+            for line in valid:
+                f.write(line + "\n")
+        logger.info(f"[COOKIE] 📦 Saved batch: {safe} ({len(valid)} lines)")
+        return {"file": safe, "lines": len(valid)}
+
+    def cookie_folder_stats(self) -> dict:
+        """How many batches and lines are queued in cookie_folder."""
+        files = self.list_cookie_files()
+        total = 0
+        for fname in files:
+            try:
+                with open(os.path.join(self.cookie_folder, fname), "r", encoding="utf-8", errors="ignore") as f:
+                    total += sum(1 for l in f if l.strip() and not l.strip().startswith("#"))
+            except Exception:
+                pass
+        return {"files": files, "file_count": len(files), "total_lines": total,
+                "active_lines": len(self._lines_cache), "current_batch": self._current_batch_file}
 
     # ── Internal: replace datadome= in a single cookie string ────────
     @staticmethod
@@ -1191,6 +1293,10 @@ class TelegramBot:
                     {"text": "📤 Upload Cookies", "callback_data": "cmd_uploadcookie"},
                     {"text": "💉 Set DataDome",   "callback_data": "cmd_setdatadome"},
                 ],
+                [
+                    {"text": "🔁 Renew Cookie",   "callback_data": "cmd_renewcookie"},
+                    {"text": "📦 Cookie Batches", "callback_data": "cmd_cookiebatches"},
+                ],
             ]
         }
 
@@ -1267,6 +1373,27 @@ class TelegramBot:
         except Exception:
             pass
 
+    def _flush_pending_updates(self):
+        """On startup: fetch all pending updates and advance the offset past them.
+        This discards any button presses / commands queued while the bot was offline
+        so they don't all replay and cause spam on the next boot.
+        """
+        if not self.token:
+            return
+        try:
+            url = f"{self.API_BASE}{self.token}/getUpdates"
+            resp = requests.get(url, params={"offset": 0, "timeout": 0}, timeout=10)
+            resp.raise_for_status()
+            results = resp.json().get("result", [])
+            if results:
+                latest_id = results[-1]["update_id"]
+                # ACK all pending updates by setting offset = latest + 1
+                requests.get(url, params={"offset": latest_id + 1, "timeout": 0}, timeout=10)
+                self._offset = latest_id
+                logger.info(f"[TG] Flushed {len(results)} pending update(s) (latest id={latest_id})")
+        except Exception as e:
+            logger.debug(f"[TG] flush_pending error: {e}")
+
     def poll(self):
         """Poll for updates (long-polling)."""
         if not self.token:
@@ -1315,6 +1442,8 @@ class TelegramBot:
             "cmd_uploadcombo":  lambda cid, **kw: self._start_upload(cid, "combo"),
             "cmd_uploadcookie": lambda cid, **kw: self._start_upload(cid, "cookie"),
             "cmd_setdatadome":  self._do_setdatadome_prompt,
+            "cmd_renewcookie":  self._do_renewcookie,
+            "cmd_cookiebatches": self._do_cookiebatches,
         }
         handler = cmd_map.get(data)
         if handler:
@@ -1489,6 +1618,10 @@ class TelegramBot:
                 fname = args[0] if args[0].endswith(".txt") else args[0] + ".txt"
                 self.combo_manager.delete_file(fname)
                 self.send_important(f"🗑 Deleted combo {fname}\nTotal accounts: {self.combo_manager.total}", chat_id)
+        elif cmd == "/renewcookie":
+            self._do_renewcookie(chat_id)
+        elif cmd == "/cookiebatches":
+            self._do_cookiebatches(chat_id)
         elif cmd == "/cookieset":
             if not args:
                 self.send_important(
@@ -1577,7 +1710,7 @@ class TelegramBot:
             "<b>🎯 Combo Harvest</b>\n"
             "/combolist /combodel /uploadcombo /harvest /harveststop /combostats\n\n"
             "<b>⚙️ Cookie</b>\n"
-            "/cookieset /setdatadome",
+            "/cookieset /setdatadome /renewcookie /cookiebatches",
             chat_id
         )
 
@@ -1893,39 +2026,82 @@ class TelegramBot:
             self.send_important(f"❌ Error: {e}", chat_id)
 
     def _handle_cookie_file_upload(self, chat_id, file_id, fname):
+        """Upload cookie .txt — saves into cookie_folder as a batch for /renewcookie rotation.
+        If the active full_cookie.txt is currently empty, auto-loads this batch immediately.
+        """
         try:
-            content, _ = self._download_tg_file(file_id)
-            if content is None:
+            file_content, _ = self._download_tg_file(file_id)
+            if file_content is None:
                 self.send_important("❌ Could not retrieve file from Telegram.", chat_id)
                 return
-            lines = list(self._iter_valid_lines(content))
-            total_in_file = len(lines)
+            lines = list(self._iter_valid_lines(file_content))
             if not lines:
                 self.send_important(f"❌ File <b>{fname}</b> is empty or has no valid cookies.", chat_id)
                 return
-            # Auto-cut at 500 lines
-            trimmed = False
-            if total_in_file > self._MAX_COOKIE_LINES:
-                lines = lines[:self._MAX_COOKIE_LINES]
-                trimmed = True
-            self.updater.write_cookie("\n".join(lines))
-            count = len(self.updater.read_all_cookies())
-            logger.info(f"[TG] Cookie file uploaded: {fname} ({count} lines) from {chat_id}")
-            trim_note = (
-                f"\n⚠️ File had <b>{total_in_file:,}</b> lines — auto-cut sa <b>{self._MAX_COOKIE_LINES}</b>"
-                if trimmed else ""
-            )
-            self.send_important(
-                f"✅ <b>Cookie file loaded!</b>\n\n"
-                f"🍪 Cookies loaded: <b>{count}</b>{trim_note}\n\n"
-                f"Lahat ng {count} cookies ay awtomatikong maa-update ng\n"
-                f"fresh datadome sa bawat successful fetch — <b>walang reload needed!</b>\n\n"
-                f"📡 API: <code>/cookie</code> → lahat ng {count} lines, live na ang datadome.",
-                chat_id
-            )
+
+            active_empty = len(self.updater.read_all_cookies()) == 0
+
+            if active_empty:
+                # No active cookies — load this file directly as the active batch
+                batch = lines[:self.updater.MAX_COOKIE_LINES]
+                self.updater.write_cookie("\n".join(batch))
+                count = len(self.updater.read_all_cookies())
+                stats = self.updater.cookie_folder_stats()
+                logger.info(f"[TG] Cookie loaded directly (active was empty): {fname} ({count} lines)")
+                self.send_important(
+                    f"✅ <b>Cookie Loaded!</b>\n\n"
+                    f"📄 File: <b>{fname}</b>\n"
+                    f"🍪 Active cookies: <b>{count}</b>\n"
+                    f"📦 Batches in queue: <b>{stats['file_count']}</b>\n\n"
+                    f"Ginamit agad dahil walang active cookies. Mag-upload pa ng mas marami para sa /renewcookie!",
+                    chat_id
+                )
+            else:
+                # Active cookies exist — save as a batch for /renewcookie
+                result = self.updater.add_cookie_batch(fname, lines)
+                stats = self.updater.cookie_folder_stats()
+                logger.info(f"[TG] Cookie batch saved: {result['file']} ({result['lines']} lines) from {chat_id}")
+                self.send_important(
+                    f"📦 <b>Cookie Batch Saved!</b>\n\n"
+                    f"📄 File: <b>{result['file']}</b>\n"
+                    f"✅ Lines: <b>{result['lines']}</b>\n"
+                    f"📦 Total batches queued: <b>{stats['file_count']}</b>\n"
+                    f"🍪 Total lines in queue: <b>{stats['total_lines']}</b>\n\n"
+                    f"Gamitin ang 🔁 <b>Renew Cookie</b> para i-load ang susunod na batch.",
+                    chat_id
+                )
         except Exception as e:
             logger.warning(f"[TG] Cookie upload error: {e}")
             self.send_important(f"❌ Error: {e}", chat_id)
+
+    def _do_renewcookie(self, chat_id, **_):
+        """Load next cookie batch from cookie_folder into the active file."""
+        result = self.updater.renew_cookie()
+        self.send_important(result["message"], chat_id)
+
+    def _do_cookiebatches(self, chat_id, **_):
+        """Show stats about queued cookie batches."""
+        stats = self.updater.cookie_folder_stats()
+        active = stats["active_lines"]
+        files  = stats["files"]
+        queued_lines = stats["total_lines"]
+        current = stats.get("current_batch") or "full_cookie.txt (default)"
+        if files:
+            file_list = "\n".join(f"  📄 {f}" for f in files[:20])
+            if len(files) > 20:
+                file_list += f"\n  ... at {len(files)-20} pa"
+        else:
+            file_list = "  (wala)"
+        self.send_important(
+            f"📦 <b>Cookie Batch Status</b>\n\n"
+            f"🍪 Active cookies: <b>{active}</b>\n"
+            f"📄 Current batch: <b>{current}</b>\n\n"
+            f"📦 Queued batches: <b>{len(files)}</b>\n"
+            f"📝 Total queued lines: <b>{queued_lines}</b>\n\n"
+            f"<b>Files in queue:</b>\n{file_list}\n\n"
+            f"Gamitin ang 🔁 <b>Renew Cookie</b> para i-load ang susunod na batch.",
+            chat_id
+        )
 
     def run_polling(self, shutdown_event):
         """Run polling loop in background thread."""
@@ -1933,6 +2109,8 @@ class TelegramBot:
             logger.info("[TG] No BOT_TOKEN set — Telegram bot disabled")
             return
         logger.info("[TG] Starting Telegram bot polling...")
+        # Discard all updates queued while bot was offline — prevents replay spam
+        self._flush_pending_updates()
         while not shutdown_event.is_set():
             self.poll()
             shutdown_event.wait(1)
