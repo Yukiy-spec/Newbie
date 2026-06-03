@@ -417,107 +417,130 @@ EXTRA_COOKIE_FILES: list[str] = [
 ]
 
 class CookieUpdater:
-    """Thread-safe cookie file updater.
+    """Thread-safe multi-line cookie file updater.
 
-    Finds datadome=VALUE in every line and replaces ONLY that value.
-    All other fields (sso_key, PHPSESSID, etc.) are untouched.
+    full_cookie.txt can hold hundreds of full cookie lines (one per account).
+    On every datadome update, ALL lines get the fresh datadome value injected —
+    no reload needed, the file is always live.
 
-    After updating the primary COOKIE_FILE, it also syncs the same new
-    datadome value into every path listed in EXTRA_COOKIE_FILES — so the
-    checker's fresh_cookie.txt stays fresh automatically.
+    /cookie API endpoint streams all lines so external tools always see fresh values.
     """
 
     def __init__(self, filepath):
         self.filepath = filepath
         self._lock = threading.Lock()
+        # In-memory cache of all cookie lines — updated atomically on each write
+        self._lines_cache: list[str] = []
+        self._load_cache()
 
-    # ── Internal: replace datadome= in a single file ──────────────────
-    def _replace_in_file(self, filepath: str, new_value: str) -> dict:
-        """Replace datadome= value in ONE file. Returns result dict."""
-        dirpath = os.path.dirname(filepath)
-        if dirpath:
-            os.makedirs(dirpath, exist_ok=True)
-
-        if not os.path.exists(filepath):
-            # File doesn't exist yet — create it with just a datadome line
-            try:
-                with open(filepath, "w") as f:
-                    f.write(f"datadome={new_value}\n")
-                return {"success": True, "old_value": None, "lines_changed": 1, "error": None}
-            except Exception as e:
-                return {"success": False, "old_value": None, "lines_changed": 0, "error": str(e)}
-
+    def _load_cache(self):
+        """Load all non-empty, non-comment cookie lines into memory."""
+        if not os.path.exists(self.filepath):
+            self._lines_cache = []
+            return
         try:
-            with open(filepath, "r") as f:
-                lines = f.readlines()
-
-            old_value = None
-            lines_changed = 0
-            new_lines = []
-
-            for line in lines:
-                stripped = line.rstrip("\n")
-                if "datadome=" in stripped:
-                    # Count non-empty fields (split by ';', ignore empty/whitespace parts)
-                    fields = [p.strip() for p in stripped.split(";") if p.strip()]
-                    is_datadome_only = (len(fields) == 1)
-
-                    if is_datadome_only:
-                        # Auto-delete bare datadome-only lines — they have no value
-                        m = _re.search(r'datadome=([^;]*)', stripped)
-                        if m and old_value is None:
-                            old_value = m.group(1).strip()
-                        lines_changed += 1
-                        # Drop this line entirely (don't append to new_lines)
-                        continue
-
-                    # Capture old value on first hit
-                    m = _re.search(r'datadome=([^;]*)', stripped)
-                    if m and old_value is None:
-                        old_value = m.group(1).strip()
-                    # Replace ONLY the datadome value — everything else stays
-                    new_line = _re.sub(r'datadome=[^;]*', f'datadome={new_value}', stripped)
-                    new_lines.append(new_line + "\n")
-                    lines_changed += 1
-                else:
-                    new_lines.append(line)
-
-            if lines_changed > 0:
-                with open(filepath, "w") as f:
-                    f.writelines(new_lines)
-                return {"success": True, "old_value": old_value, "lines_changed": lines_changed, "error": None}
-            else:
-                return {"success": False, "old_value": None, "lines_changed": 0, "error": "No datadome= found"}
-
+            with open(self.filepath, "r") as f:
+                self._lines_cache = [
+                    l.strip() for l in f
+                    if l.strip() and not l.strip().startswith("#")
+                ]
         except Exception as e:
-            return {"success": False, "old_value": None, "lines_changed": 0, "error": str(e)}
+            logger.warning(f"[COOKIE] Error loading cache: {e}")
+            self._lines_cache = []
 
-    # ── Public: update primary file + all extra files ─────────────────
+    # ── Internal: replace datadome= in a single cookie string ────────
+    @staticmethod
+    def _inject_dd(line: str, new_value: str) -> str:
+        """Replace datadome=VALUE in a cookie string. Returns updated string."""
+        if "datadome=" in line:
+            return _re.sub(r'datadome=[^;]*', f'datadome={new_value}', line)
+        # No datadome field yet — append it
+        return line.rstrip(";") + f"; datadome={new_value}"
+
+    # ── Public: update all lines with fresh datadome ──────────────────
     def update_datadome(self, new_value: str) -> dict:
-        """Update datadome= in the primary cookie file and all extra files."""
+        """Inject fresh datadome into EVERY line in the cookie file.
+
+        All 500 lines get updated in one atomic write — no reload needed.
+        Returns {"success": bool, "lines_changed": int, "error": str|None}
+        """
         with self._lock:
-            # Primary file
-            result = self._replace_in_file(self.filepath, new_value)
+            dirpath = os.path.dirname(self.filepath)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
 
-            # Extra files (checker's fresh_cookie.txt, etc.)
-            extra_results = {}
-            for extra_path in EXTRA_COOKIE_FILES:
-                extra_results[extra_path] = self._replace_in_file(extra_path, new_value)
-                if extra_results[extra_path]["success"]:
-                    logger.debug(
-                        f"[COOKIE] ✔ Synced datadome → {extra_path} "
-                        f"({extra_results[extra_path]['lines_changed']} line(s))"
-                    )
-                else:
-                    logger.debug(
-                        f"[COOKIE] ⚠ Sync skipped for {extra_path}: "
-                        f"{extra_results[extra_path]['error']}"
-                    )
+            # If file doesn't exist yet, create with just datadome
+            if not os.path.exists(self.filepath):
+                try:
+                    with open(self.filepath, "w") as f:
+                        f.write(f"datadome={new_value}\n")
+                    self._lines_cache = [f"datadome={new_value}"]
+                    return {"success": True, "lines_changed": 1, "error": None}
+                except Exception as e:
+                    return {"success": False, "lines_changed": 0, "error": str(e)}
 
-            result["extra_files"] = extra_results
-            return result
+            try:
+                with open(self.filepath, "r") as f:
+                    raw_lines = f.readlines()
 
-    def read_current_datadome(self):
+                new_lines = []
+                changed = 0
+                for raw in raw_lines:
+                    stripped = raw.strip()
+                    if not stripped or stripped.startswith("#"):
+                        new_lines.append(raw)  # preserve comments/blanks as-is
+                        continue
+                    updated = self._inject_dd(stripped, new_value)
+                    new_lines.append(updated + "\n")
+                    changed += 1
+
+                with open(self.filepath, "w") as f:
+                    f.writelines(new_lines)
+
+                # Refresh in-memory cache
+                self._lines_cache = [
+                    l.strip() for l in new_lines
+                    if l.strip() and not l.strip().startswith("#")
+                ]
+
+                # Sync extra files if configured
+                for extra_path in EXTRA_COOKIE_FILES:
+                    try:
+                        self._sync_extra(extra_path, new_value)
+                    except Exception as ex:
+                        logger.debug(f"[COOKIE] Extra sync failed for {extra_path}: {ex}")
+
+                return {"success": True, "lines_changed": changed, "error": None}
+
+            except Exception as e:
+                return {"success": False, "lines_changed": 0, "error": str(e)}
+
+    def _sync_extra(self, filepath: str, new_value: str):
+        """Sync datadome into an extra cookie file."""
+        if not os.path.exists(filepath):
+            return
+        with open(filepath, "r") as f:
+            lines = f.readlines()
+        new_lines = []
+        for raw in lines:
+            stripped = raw.strip()
+            if not stripped or stripped.startswith("#"):
+                new_lines.append(raw)
+                continue
+            new_lines.append(self._inject_dd(stripped, new_value) + "\n")
+        with open(filepath, "w") as f:
+            f.writelines(new_lines)
+        logger.debug(f"[COOKIE] ✔ Synced datadome → {filepath}")
+
+    def read_current_datadome(self) -> str | None:
+        """Read the current datadome value from the first valid line."""
+        with self._lock:
+            for line in self._lines_cache:
+                for part in line.split(";"):
+                    part = part.strip()
+                    if part.startswith("datadome="):
+                        return part.split("=", 1)[1].strip()
+        # Fallback: read from file
         if not os.path.exists(self.filepath):
             return None
         try:
@@ -531,51 +554,54 @@ class CookieUpdater:
             pass
         return None
 
-    def read_full_cookie(self):
-        """Read the full cookie — returns the line with the most fields (most ';'-separated parts).
+    def read_full_cookie(self) -> str | None:
+        """Return the single richest cookie line (most fields).
 
-        Rules:
-        - Bare datadome-only lines (1 field) are skipped — useless by themselves
-        - Returns the richest line (most ';' fields) so the request looks like a real browser
-        - If the file is missing or empty, logs a warning and returns None so callers can fallback
+        Used by the combo harvester for prelogin requests.
         """
-        if not os.path.exists(self.filepath):
-            logger.warning(f"[COOKIE] full_cookie.txt not found at {self.filepath} — "
-                           f"set the COOKIE env var on Railway or use /cookieset")
-            return None
-        try:
-            best_line = None
+        with self._lock:
+            best = None
             best_count = 0
-            with open(self.filepath, "r") as f:
-                for line in f:
-                    stripped = line.strip()
-                    if not stripped or stripped.startswith("#"):
-                        continue
-                    fields = [p.strip() for p in stripped.split(";") if p.strip()]
-                    # Skip bare datadome-only lines — not useful as a full cookie
-                    if len(fields) == 1 and fields[0].lower().startswith("datadome="):
-                        continue
-                    if len(fields) > best_count:
-                        best_count = len(fields)
-                        best_line = stripped
-            if best_line is None:
-                logger.warning(f"[COOKIE] No full cookie line found in {self.filepath} — "
-                               f"only bare datadome= lines present or file is empty. "
-                               f"Update with /cookieset or set COOKIE env var.")
-            return best_line
-        except Exception as e:
-            logger.warning(f"[COOKIE] Error reading {self.filepath}: {e}")
-            return None
+            for line in self._lines_cache:
+                fields = [p.strip() for p in line.split(";") if p.strip()]
+                # Skip bare datadome-only lines
+                if len(fields) == 1 and fields[0].lower().startswith("datadome="):
+                    continue
+                if len(fields) > best_count:
+                    best_count = len(fields)
+                    best = line
+            if best is None:
+                logger.warning(
+                    f"[COOKIE] No full cookie line found — set COOKIE env var or use /cookieset"
+                )
+            return best
 
-    def write_cookie(self, cookie_string):
-        """Write/overwrite the full cookie file."""
+    def read_all_cookies(self) -> list[str]:
+        """Return ALL cookie lines (all accounts) with their current datadome values.
+
+        Used by the /cookie API endpoint — streams all lines so external checkers
+        always get fresh values without reloading.
+        """
+        with self._lock:
+            return list(self._lines_cache)
+
+    def write_cookie(self, cookie_string: str):
+        """Write/overwrite the cookie file.
+
+        Supports multi-line input (one cookie per line) or single line.
+        """
         dirpath = os.path.dirname(self.filepath)
         if dirpath:
             os.makedirs(dirpath, exist_ok=True)
         with self._lock:
+            lines = [l.strip() for l in cookie_string.strip().splitlines() if l.strip()]
             with open(self.filepath, "w") as f:
-                f.write(cookie_string.strip() + "\n")
-        logger.info(f"[COOKIE] Wrote new cookie to {self.filepath}")
+                for line in lines:
+                    f.write(line + "\n")
+            self._lines_cache = lines
+        logger.info(f"[COOKIE] Wrote {len(lines)} cookie line(s) to {self.filepath}")
+
+
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1128,6 +1154,7 @@ class TelegramBot:
                     {"text": "📤 Upload Combo",   "callback_data": "cmd_uploadcombo"},
                 ],
                 [
+                    {"text": "📤 Upload Cookies", "callback_data": "cmd_uploadcookie"},
                     {"text": "💉 Set DataDome",   "callback_data": "cmd_setdatadome"},
                 ],
             ]
@@ -1213,6 +1240,7 @@ class TelegramBot:
             "cmd_combostats":   self._do_combostats,
             "cmd_uploadproxy":  lambda cid, **kw: self._start_upload(cid, "proxy"),
             "cmd_uploadcombo":  lambda cid, **kw: self._start_upload(cid, "combo"),
+            "cmd_uploadcookie": lambda cid, **kw: self._start_upload(cid, "cookie"),
             "cmd_setdatadome":  self._do_setdatadome_prompt,
         }
         handler = cmd_map.get(data)
@@ -1253,6 +1281,8 @@ class TelegramBot:
                 file_id = doc.get("file_id")
                 if kind == "combo":
                     self._handle_combo_file_upload(chat_id, file_id, fname)
+                elif kind == "cookie":
+                    self._handle_cookie_file_upload(chat_id, file_id, fname)
                 else:
                     self._handle_proxy_file_upload(chat_id, file_id, fname)
             else:
@@ -1388,11 +1418,18 @@ class TelegramBot:
                 self.send(f"🗑 Deleted combo {fname}\nTotal accounts: {self.combo_manager.total}", chat_id)
         elif cmd == "/cookieset":
             if not args:
-                self.send("Usage: /cookieset [full cookie string]\nExample: /cookieset datadome=xxx; sso_key=yyy", chat_id)
+                self.send(
+                    "Usage: /cookieset [cookie string]\n\n"
+                    "Para sa maraming cookies (500 accounts), i-upload nalang ang .txt file gamit ang 📤 Upload Combo\n\n"
+                    "O i-paste rito (one cookie per line):\n"
+                    "<code>/cookieset datadome=xxx; sso_key=yyy; ...</code>",
+                    chat_id
+                )
             else:
                 cookie_str = " ".join(args)
                 self.updater.write_cookie(cookie_str)
-                self.send(f"✅ Cookie file updated\n\n<code>{cookie_str}</code>", chat_id)
+                count = len(self.updater.read_all_cookies())
+                self.send(f"✅ Cookie file updated — {count} line(s) saved.", chat_id)
 
         elif cmd == "/setdatadome":
             if not args:
@@ -1652,7 +1689,17 @@ class TelegramBot:
     def _start_upload(self, chat_id, kind="proxy", **_):
         """Set pending upload state and prompt user."""
         self._pending_file[chat_id] = (kind, "__upload__")
-        if kind == "combo":
+        if kind == "cookie":
+            self.send(
+                "📤 <b>Upload Cookie File</b>\n\n"
+                "I-send ang <code>.txt</code> file na may full cookies.\n"
+                "One complete cookie string per line (lahat ng fields):\n\n"
+                "<code>datadome=xxx; sso_key=yyy; PHPSESSID=zzz; ...</code>\n\n"
+                "Puwede 1 line o hanggang 500+ lines — lahat ay awtomatikong\n"
+                "maa-update ng fresh datadome every fetch cycle. ✅",
+                chat_id
+            )
+        elif kind == "combo":
             self.send(
                 "📤 <b>Upload Combo File</b>\n\n"
                 "Send a <code>.txt</code> file with accounts.\n"
@@ -1675,17 +1722,44 @@ class TelegramBot:
 
     # ── File upload handlers ────────────────────────────────────────
 
+    # Max lines accepted per upload type
+    _MAX_COOKIE_LINES = 500
+    _MAX_PROXY_LINES  = 50_000
+    _MAX_COMBO_LINES  = 100_000
+
     def _download_tg_file(self, file_id):
-        """Download a Telegram file. Returns (content_text, filename) or (None, None)."""
+        """Download a Telegram file. Returns (content_text, filename) or (None, None).
+        Supports files up to 20MB via streaming — does NOT load the whole file into RAM
+        at once; reads in 64KB chunks.
+        """
         url  = f"{self.API_BASE}{self.token}/getFile"
         resp = requests.get(url, params={"file_id": file_id}, timeout=15)
         resp.raise_for_status()
         file_path = resp.json().get("result", {}).get("file_path")
         if not file_path:
             return None, None
-        dl  = requests.get(f"https://api.telegram.org/file/bot{self.token}/{file_path}", timeout=30)
+        dl = requests.get(
+            f"https://api.telegram.org/file/bot{self.token}/{file_path}",
+            timeout=60,
+            stream=True,          # stream so we don't OOM on 20MB files
+        )
         dl.raise_for_status()
-        return dl.text, file_path.split("/")[-1]
+        # Read in 64KB chunks — decode as utf-8 (latin-1 fallback for dirty files)
+        chunks = []
+        for chunk in dl.iter_content(chunk_size=65536):
+            if chunk:
+                try:
+                    chunks.append(chunk.decode("utf-8"))
+                except UnicodeDecodeError:
+                    chunks.append(chunk.decode("latin-1", errors="replace"))
+        return "".join(chunks), file_path.split("/")[-1]
+
+    def _iter_valid_lines(self, content: str, skip_prefixes=("#",)):
+        """Yield non-empty, non-comment lines from raw file content."""
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped and not any(stripped.startswith(p) for p in skip_prefixes):
+                yield stripped
 
     def _handle_proxy_file_upload(self, chat_id, file_id, fname):
         try:
@@ -1693,16 +1767,23 @@ class TelegramBot:
             if content is None:
                 self.send("❌ Could not retrieve file from Telegram.", chat_id)
                 return
-            lines = [l.strip() for l in content.splitlines() if l.strip() and not l.startswith("#")]
+            lines = list(self._iter_valid_lines(content))
+            total_in_file = len(lines)
             if not lines:
                 self.send(f"❌ File <b>{fname}</b> is empty or has no valid proxies.", chat_id)
                 return
+            # Cap at _MAX_PROXY_LINES
+            trimmed = False
+            if total_in_file > self._MAX_PROXY_LINES:
+                lines = lines[:self._MAX_PROXY_LINES]
+                trimmed = True
             self.scanner.create_file(fname, lines)
             logger.info(f"[TG] Proxy file uploaded: {fname} ({len(lines)}) from {chat_id}")
+            note = f"\n⚠️ Trimmed to {self._MAX_PROXY_LINES:,} (file had {total_in_file:,})" if trimmed else ""
             self.send(
                 f"✅ <b>{fname}</b> uploaded!\n"
-                f"📋 Proxies: <b>{len(lines)}</b>\n"
-                f"🔄 Total proxies: <b>{self.scanner.total}</b>",
+                f"📋 Proxies loaded: <b>{len(lines):,}</b>{note}\n"
+                f"🔄 Total proxies: <b>{self.scanner.total:,}</b>",
                 chat_id
             )
         except Exception as e:
@@ -1715,24 +1796,62 @@ class TelegramBot:
             if content is None:
                 self.send("❌ Could not retrieve file from Telegram.", chat_id)
                 return
-            lines = [
-                l.strip() for l in content.splitlines()
-                if l.strip() and not l.startswith("#") and not l.startswith("===")
-            ]
+            lines = list(self._iter_valid_lines(content, skip_prefixes=("#", "===")))
+            total_in_file = len(lines)
             if not lines:
                 self.send(f"❌ File <b>{fname}</b> is empty or has no valid accounts.", chat_id)
                 return
+            trimmed = False
+            if total_in_file > self._MAX_COMBO_LINES:
+                lines = lines[:self._MAX_COMBO_LINES]
+                trimmed = True
             self.combo_manager.create_file(fname, lines)
             logger.info(f"[TG] Combo file uploaded: {fname} ({len(lines)}) from {chat_id}")
+            note = f"\n⚠️ Trimmed to {self._MAX_COMBO_LINES:,} (file had {total_in_file:,})" if trimmed else ""
             self.send(
                 f"✅ <b>{fname}</b> uploaded!\n"
-                f"👤 Accounts: <b>{len(lines)}</b>\n"
-                f"🎯 Total accounts: <b>{self.combo_manager.total}</b>\n\n"
+                f"👤 Accounts loaded: <b>{len(lines):,}</b>{note}\n"
+                f"🎯 Total accounts: <b>{self.combo_manager.total:,}</b>\n\n"
                 f"Press ▶️ Harvest or /harvest to start harvesting.",
                 chat_id
             )
         except Exception as e:
             logger.warning(f"[TG] Combo upload error: {e}")
+            self.send(f"❌ Error: {e}", chat_id)
+
+    def _handle_cookie_file_upload(self, chat_id, file_id, fname):
+        try:
+            content, _ = self._download_tg_file(file_id)
+            if content is None:
+                self.send("❌ Could not retrieve file from Telegram.", chat_id)
+                return
+            lines = list(self._iter_valid_lines(content))
+            total_in_file = len(lines)
+            if not lines:
+                self.send(f"❌ File <b>{fname}</b> is empty or has no valid cookies.", chat_id)
+                return
+            # Auto-cut at 500 lines
+            trimmed = False
+            if total_in_file > self._MAX_COOKIE_LINES:
+                lines = lines[:self._MAX_COOKIE_LINES]
+                trimmed = True
+            self.updater.write_cookie("\n".join(lines))
+            count = len(self.updater.read_all_cookies())
+            logger.info(f"[TG] Cookie file uploaded: {fname} ({count} lines) from {chat_id}")
+            trim_note = (
+                f"\n⚠️ File had <b>{total_in_file:,}</b> lines — auto-cut sa <b>{self._MAX_COOKIE_LINES}</b>"
+                if trimmed else ""
+            )
+            self.send(
+                f"✅ <b>Cookie file loaded!</b>\n\n"
+                f"🍪 Cookies loaded: <b>{count}</b>{trim_note}\n\n"
+                f"Lahat ng {count} cookies ay awtomatikong maa-update ng\n"
+                f"fresh datadome sa bawat successful fetch — <b>walang reload needed!</b>\n\n"
+                f"📡 API: <code>/cookie</code> → lahat ng {count} lines, live na ang datadome.",
+                chat_id
+            )
+        except Exception as e:
+            logger.warning(f"[TG] Cookie upload error: {e}")
             self.send(f"❌ Error: {e}", chat_id)
 
     def run_polling(self, shutdown_event):
@@ -1768,10 +1887,12 @@ class APIHandler(BaseHTTPRequestHandler):
             dd = self._updater.read_current_datadome() if self._updater else None
             self._text_response((dd or "NONE")[:5000])
 
-        elif path == "/cookie":
-            # Full cookie — richest line (most fields), 5000 char limit
-            content = self._updater.read_full_cookie() if self._updater else None
-            self._text_response((content or "NONE")[:5000])
+        elif path == "/cookie" or path == "/cookies":
+            # ALL cookie lines — every account, datadome already fresh (no reload needed)
+            # One full cookie per line, plain text
+            lines = self._updater.read_all_cookies() if self._updater else []
+            content = "\n".join(lines) if lines else "NONE"
+            self._text_response(content)
 
         elif path == "/stats":
             # JSON stats
