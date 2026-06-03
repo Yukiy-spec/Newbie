@@ -2511,10 +2511,62 @@ class DataDomeBotEngine:
         if self.shutdown_event.is_set():
             return
 
-        # ── Auto-fetch loop DISABLED — manual mode only ──
-        # DataDome fetch starts only when ▶️ Harvest button is pressed.
-        logger.info("[BOT] ⏸ Manual mode — waiting for Harvest command via Telegram...")
-        self.shutdown_event.wait()
+        # Main fetch loop — parallel workers (no Telegram spam — auto_notify removed)
+        logger.info(f"[BOT] 🚀 Starting {NUM_WORKERS}-worker parallel fetch loop...")
+        cycle_counter = [0]
+        cycle_lock = threading.Lock()
+        last_stats_log = [time.time()]
+
+        def worker_loop(thread_id):
+            while not self.shutdown_event.is_set():
+                # ── Pause gate — workers wait here during /setdatadome inject ──
+                if not self.dd_pool.ready.is_set():
+                    self.dd_pool.ready.wait(timeout=60)
+                    if self.shutdown_event.is_set():
+                        break
+
+                if DELAY_MS > 0:
+                    self.shutdown_event.wait(timeout=DELAY_MS / 1000.0)
+                    if self.shutdown_event.is_set():
+                        break
+
+                result = self.fetcher.fetch(thread_id=thread_id)
+
+                with cycle_lock:
+                    cycle_counter[0] += 1
+
+                if result["success"]:
+                    dd = result["datadome"]
+                    dd_short = dd[:30] + "..." if len(dd) > 30 else dd
+                    update = self.updater.update_datadome(dd)
+                    self.stats.record_fetch(True, result.get("latency_ms", 0), update.get("success", False))
+                    self.dd_pool.record_success(dd)
+
+                    if not BOT_MODE:
+                        logger.debug(f"[BOT] ✔ {dd_short} | {result.get('latency_ms', 0)}ms | proxy: {result['proxy']}")
+                else:
+                    self.stats.record_fetch(False)
+                    current_dd = self.dd_pool.get_best()
+                    if current_dd:
+                        self.dd_pool.record_failure(current_dd)
+                    if not BOT_MODE:
+                        logger.debug(f"[BOT] ✘ {result.get('error', '?')} | proxy: {result.get('proxy', '?')}")
+
+                # ── Console stats log every 30s (one thread wins the lock) ──
+                now = time.time()
+                if now - last_stats_log[0] > 30:
+                    with cycle_lock:
+                        if now - last_stats_log[0] > 30:
+                            last_stats_log[0] = now
+                            s = self.stats.get_stats()
+                            logger.info(
+                                f"[BOT] 📊 {s['fetched']} fetched | {s['updated']} updated | "
+                                f"{s['failed']} failed | avg: {s['avg_latency_ms']}ms"
+                            )
+
+        with ThreadPoolExecutor(max_workers=NUM_WORKERS, thread_name_prefix="ddworker") as pool:
+            futures = [pool.submit(worker_loop, i) for i in range(NUM_WORKERS)]
+            self.shutdown_event.wait()
 
         # Shutdown
         logger.info("[BOT] ⚠ Shutting down...")
