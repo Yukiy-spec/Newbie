@@ -1120,6 +1120,9 @@ class TelegramBot:
 
     API_BASE = "https://api.telegram.org/bot"
 
+    # Auto-notify interval: only 1 background status message per N seconds
+    AUTO_NOTIFY_INTERVAL = 300  # 5 minutes
+
     def __init__(self, token, chat_id, scanner, updater, fetcher, stats_ref,
                  combo_manager=None, combo_harvester=None, combo_stats=None,
                  dd_pool=None):
@@ -1137,6 +1140,13 @@ class TelegramBot:
         self._lock = threading.Lock()
         self._allowed_chats = set()
         self._pending_file = {}   # {chat_id: ("proxy"|"combo", filename|"__upload__")}
+        # Rate-limit: enforces a minimum gap between outgoing messages
+        self._send_lock = threading.Lock()
+        self._last_sent_at = 0.0          # timestamp of last sent message
+        self._min_send_gap = 1.5          # seconds — Telegram allows ~1 msg/sec per bot
+        # Auto-notify gate: background worker messages use this separate timestamp
+        self._last_auto_notify = 0.0
+        self._auto_notify_lock = threading.Lock()
         if chat_id:
             self._allowed_chats.add(str(chat_id))
 
@@ -1177,18 +1187,65 @@ class TelegramBot:
         }
 
     def send(self, text, chat_id=None, parse_mode="HTML", menu=True):
-        """Send a message with optional inline menu."""
+        """Send a message — thread-safe, rate-limited.
+
+        Non-blocking acquire: if another thread is already sending, this call
+        is dropped immediately so workers never pile up a backlog of messages.
+        """
         cid = chat_id or self.chat_id
         if not self.token or not cid:
             return
-        payload = {"chat_id": cid, "text": text, "parse_mode": parse_mode}
-        if menu:
-            payload["reply_markup"] = self._main_menu()
+        if not self._send_lock.acquire(blocking=False):
+            return  # another thread is sending right now — drop this one
         try:
-            url = f"{self.API_BASE}{self.token}/sendMessage"
-            requests.post(url, json=payload, timeout=10)
-        except Exception:
-            pass
+            now = time.time()
+            if now - self._last_sent_at < self._min_send_gap:
+                return  # too soon since last message — drop silently
+            self._last_sent_at = now
+            payload = {"chat_id": cid, "text": text, "parse_mode": parse_mode}
+            if menu:
+                payload["reply_markup"] = self._main_menu()
+            try:
+                requests.post(f"{self.API_BASE}{self.token}/sendMessage",
+                              json=payload, timeout=10)
+            except Exception:
+                pass
+        finally:
+            self._send_lock.release()
+
+    def send_important(self, text, chat_id=None, parse_mode="HTML", menu=True):
+        """Like send() but guaranteed delivery — waits for rate-limit gap instead
+        of dropping.  Use for one-time events: startup, shutdown, command replies.
+        """
+        cid = chat_id or self.chat_id
+        if not self.token or not cid:
+            return
+        with self._send_lock:
+            wait = self._min_send_gap - (time.time() - self._last_sent_at)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_sent_at = time.time()
+            payload = {"chat_id": cid, "text": text, "parse_mode": parse_mode}
+            if menu:
+                payload["reply_markup"] = self._main_menu()
+            try:
+                requests.post(f"{self.API_BASE}{self.token}/sendMessage",
+                              json=payload, timeout=10)
+            except Exception:
+                pass
+
+    def auto_notify(self, text):
+        """Background status update — fires at most once per AUTO_NOTIFY_INTERVAL
+        seconds no matter how many threads call it simultaneously.
+        """
+        now = time.time()
+        if now - self._last_auto_notify < self.AUTO_NOTIFY_INTERVAL:
+            return
+        with self._auto_notify_lock:
+            if now - self._last_auto_notify < self.AUTO_NOTIFY_INTERVAL:
+                return  # another thread already won the race
+            self._last_auto_notify = now
+        self.send_important(text)  # send outside the lock
 
     def answer_callback(self, callback_query_id, text=""):
         """Answer a callback query (clears the loading spinner)."""
@@ -1292,7 +1349,7 @@ class TelegramBot:
                 self._pending_file.pop(chat_id, None)
                 fname = doc.get("file_name", "uploaded.txt")
                 if not fname.lower().endswith(".txt"):
-                    self.send("❌ Only <code>.txt</code> files are accepted.", chat_id)
+                    self.send_important("❌ Only <code>.txt</code> files are accepted.", chat_id)
                     return
                 file_id = doc.get("file_id")
                 if kind == "combo":
@@ -1302,7 +1359,7 @@ class TelegramBot:
                 else:
                     self._handle_proxy_file_upload(chat_id, file_id, fname)
             else:
-                self.send(
+                self.send_important(
                     "💡 Use /uploadproxy or /uploadcombo first, then send your .txt file.",
                     chat_id
                 )
@@ -1317,14 +1374,14 @@ class TelegramBot:
                 # ── DataDome inject flow ───────────────────────────────
                 if kind == "datadome_inject":
                     if not text.strip():
-                        self.send("❌ Walang natanggap na value. Try ulit.", chat_id)
+                        self.send_important("❌ Walang natanggap na value. Try ulit.", chat_id)
                         return
                     if self.dd_pool:
                         def _do_inject():
                             result = self.dd_pool.inject(
                                 text.strip(),
                                 fetcher=self.fetcher,
-                                notify_fn=lambda msg: self.send(msg, chat_id)
+                                notify_fn=lambda msg: self.send_important(msg, chat_id)
                             )
                             injected = result.get("injected", [])
                             failed   = result.get("failed", [])
@@ -1333,7 +1390,7 @@ class TelegramBot:
                             good_block = "\n".join(f"✅ <code>{v[:30]}...</code>" for v in injected) or "❌ None validated"
                             bad_block  = ("\n\n⚠️ <b>Failed:</b>\n" + "\n".join(f"❌ <code>{v[:30]}...</code>" for v in failed)) if failed else ""
 
-                            self.send(
+                            self.send_important(
                                 f"✅ <b>DataDome Inject Complete!</b>\n\n"
                                 f"💉 <b>Injected ({len(injected)}):</b>\n{good_block}"
                                 f"{bad_block}\n\n"
@@ -1348,7 +1405,7 @@ class TelegramBot:
                         if raw.lower().startswith("datadome="):
                             raw = raw.split("=", 1)[1].strip()
                         r = self.updater.update_datadome(raw)
-                        self.send(
+                        self.send_important(
                             f"✅ DataDome updated!\n<code>{raw[:40]}...</code>" if r.get("success")
                             else f"❌ Failed: {r.get('error','?')}",
                             chat_id
@@ -1357,17 +1414,17 @@ class TelegramBot:
 
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 if not lines:
-                    self.send("❌ No entries found in message.", chat_id)
+                    self.send_important("❌ No entries found in message.", chat_id)
                 elif kind == "combo":
                     self.combo_manager.create_file(fname, lines)
-                    self.send(
+                    self.send_important(
                         f"✅ Created combo <b>{fname}</b> with {len(lines)} accounts\n"
                         f"Total accounts: {self.combo_manager.total}",
                         chat_id
                     )
                 else:
                     self.scanner.create_file(fname, lines)
-                    self.send(
+                    self.send_important(
                         f"✅ Created <b>{fname}</b> with {len(lines)} proxies\n"
                         f"Total proxies: {self.scanner.total}",
                         chat_id
@@ -1406,35 +1463,35 @@ class TelegramBot:
             self._start_upload(chat_id, "combo")
         elif cmd == "/proxyadd":
             if len(args) < 2:
-                self.send("Usage: /proxyadd [filename] [ip:port]\nExample: /proxyadd us.txt 1.2.3.4:8080", chat_id)
+                self.send_important("Usage: /proxyadd [filename] [ip:port]\nExample: /proxyadd us.txt 1.2.3.4:8080", chat_id)
             else:
                 fname = args[0] if args[0].endswith(".txt") else args[0] + ".txt"
                 self.scanner.add_proxy_to_file(fname, args[1])
-                self.send(f"✅ Added <code>{args[1]}</code> to {fname}\nTotal proxies: {self.scanner.total}", chat_id)
+                self.send_important(f"✅ Added <code>{args[1]}</code> to {fname}\nTotal proxies: {self.scanner.total}", chat_id)
         elif cmd == "/proxynew":
             if not args:
-                self.send("Usage: /proxynew [filename]\nThen send proxies in next message (one per line)", chat_id)
+                self.send_important("Usage: /proxynew [filename]\nThen send proxies in next message (one per line)", chat_id)
             else:
                 fname = args[0] if args[0].endswith(".txt") else args[0] + ".txt"
                 self._pending_file[chat_id] = ("proxy", fname)
-                self.send(f"📄 Send proxies for <b>{fname}</b> (one ip:port per line):", chat_id)
+                self.send_important(f"📄 Send proxies for <b>{fname}</b> (one ip:port per line):", chat_id)
         elif cmd == "/proxydel":
             if not args:
-                self.send("Usage: /proxydel [filename]", chat_id)
+                self.send_important("Usage: /proxydel [filename]", chat_id)
             else:
                 fname = args[0] if args[0].endswith(".txt") else args[0] + ".txt"
                 self.scanner.delete_file(fname)
-                self.send(f"🗑 Deleted {fname}\nTotal proxies: {self.scanner.total}", chat_id)
+                self.send_important(f"🗑 Deleted {fname}\nTotal proxies: {self.scanner.total}", chat_id)
         elif cmd == "/combodel":
             if not args:
-                self.send("Usage: /combodel [filename]", chat_id)
+                self.send_important("Usage: /combodel [filename]", chat_id)
             else:
                 fname = args[0] if args[0].endswith(".txt") else args[0] + ".txt"
                 self.combo_manager.delete_file(fname)
-                self.send(f"🗑 Deleted combo {fname}\nTotal accounts: {self.combo_manager.total}", chat_id)
+                self.send_important(f"🗑 Deleted combo {fname}\nTotal accounts: {self.combo_manager.total}", chat_id)
         elif cmd == "/cookieset":
             if not args:
-                self.send(
+                self.send_important(
                     "Usage: /cookieset [cookie string]\n\n"
                     "Para sa maraming cookies (500 accounts), i-upload nalang ang .txt file gamit ang 📤 Upload Combo\n\n"
                     "O i-paste rito (one cookie per line):\n"
@@ -1445,11 +1502,11 @@ class TelegramBot:
                 cookie_str = " ".join(args)
                 self.updater.write_cookie(cookie_str)
                 count = len(self.updater.read_all_cookies())
-                self.send(f"✅ Cookie file updated — {count} line(s) saved.", chat_id)
+                self.send_important(f"✅ Cookie file updated — {count} line(s) saved.", chat_id)
 
         elif cmd == "/setdatadome":
             if not args:
-                self.send(
+                self.send_important(
                     "💉 <b>Set Fresh DataDome</b>\n\n"
                     "Usage: <code>/setdatadome value1, value2, value3</code>\n\n"
                     "• Isang value lang → i-validate at i-inject agad\n"
@@ -1470,7 +1527,7 @@ class TelegramBot:
                         result = self.dd_pool.inject(
                             raw,
                             fetcher=self.fetcher,
-                            notify_fn=lambda msg: self.send(msg, chat_id)
+                            notify_fn=lambda msg: self.send_important(msg, chat_id)
                         )
                         injected = result.get("injected", [])
                         failed   = result.get("failed", [])
@@ -1487,7 +1544,7 @@ class TelegramBot:
                             bad_lines = [f"❌ <code>{v[:30]}...</code>" for v in failed]
                             bad_block = "\n\n⚠️ <b>Failed validation:</b>\n" + "\n".join(bad_lines)
 
-                        self.send(
+                        self.send_important(
                             f"✅ <b>DataDome Inject Complete!</b>\n\n"
                             f"💉 <b>Injected ({len(injected)}):</b>\n{good_block}"
                             f"{bad_block}\n\n"
@@ -1503,14 +1560,14 @@ class TelegramBot:
                         fresh_dd = fresh_dd.split("=", 1)[1].strip()
                     result = self.updater.update_datadome(fresh_dd)
                     if result.get("success"):
-                        self.send(f"✅ DataDome updated!\n\n<code>{fresh_dd[:40]}...</code>", chat_id)
+                        self.send_important(f"✅ DataDome updated!\n\n<code>{fresh_dd[:40]}...</code>", chat_id)
                     else:
-                        self.send(f"❌ Failed: {result.get('error','?')}", chat_id)
+                        self.send_important(f"❌ Failed: {result.get('error','?')}", chat_id)
 
     # ── Command handlers (shared by text commands & button callbacks) ──
 
     def _do_start(self, chat_id, **_):
-        self.send(
+        self.send_important(
             "🛡 <b>DataDome Bot</b>\n\n"
             "Use the buttons below to navigate, or type commands:\n\n"
             "<b>📡 Monitoring</b>\n"
@@ -1548,7 +1605,7 @@ class TelegramBot:
         if message_id:
             self.edit_message(chat_id, message_id, text)
         else:
-            self.send(text, chat_id)
+            self.send_important(text, chat_id)
 
     def _do_stats(self, chat_id, message_id=None, **_):
         stats     = self.stats.get_stats()
@@ -1570,7 +1627,7 @@ class TelegramBot:
         if message_id:
             self.edit_message(chat_id, message_id, text)
         else:
-            self.send(text, chat_id)
+            self.send_important(text, chat_id)
 
     def _do_datadome(self, chat_id, message_id=None, **_):
         dd = self.updater.read_current_datadome()
@@ -1578,7 +1635,7 @@ class TelegramBot:
         if message_id:
             self.edit_message(chat_id, message_id, text)
         else:
-            self.send(text, chat_id)
+            self.send_important(text, chat_id)
 
     def _do_cookie(self, chat_id, message_id=None, **_):
         content = self.updater.read_full_cookie()
@@ -1586,7 +1643,7 @@ class TelegramBot:
         if message_id:
             self.edit_message(chat_id, message_id, text)
         else:
-            self.send(text, chat_id)
+            self.send_important(text, chat_id)
 
     def _do_setdatadome_prompt(self, chat_id, message_id=None, **_):
         """Button press — set pending state then ask user to paste value(s)."""
@@ -1603,7 +1660,7 @@ class TelegramBot:
         if message_id:
             self.edit_message(chat_id, message_id, text)
         else:
-            self.send(text, chat_id)
+            self.send_important(text, chat_id)
 
     def _do_proxylist(self, chat_id, message_id=None, **_):
         files      = self.scanner.list_files()
@@ -1616,7 +1673,7 @@ class TelegramBot:
         if message_id:
             self.edit_message(chat_id, message_id, text)
         else:
-            self.send(text, chat_id)
+            self.send_important(text, chat_id)
 
     def _do_rescan(self, chat_id, message_id=None, **_):
         n    = self.scanner.rescan()
@@ -1624,7 +1681,7 @@ class TelegramBot:
         if message_id:
             self.edit_message(chat_id, message_id, text)
         else:
-            self.send(text, chat_id)
+            self.send_important(text, chat_id)
 
     def _do_combolist(self, chat_id, message_id=None, **_):
         if not self.combo_manager:
@@ -1640,7 +1697,7 @@ class TelegramBot:
         if message_id:
             self.edit_message(chat_id, message_id, text)
         else:
-            self.send(text, chat_id)
+            self.send_important(text, chat_id)
 
     def _do_harvest(self, chat_id, message_id=None, **_):
         if not self.combo_harvester or not self.combo_manager:
@@ -1665,7 +1722,7 @@ class TelegramBot:
         if message_id:
             self.edit_message(chat_id, message_id, text)
         else:
-            self.send(text, chat_id)
+            self.send_important(text, chat_id)
 
     def _do_harveststop(self, chat_id, message_id=None, **_):
         if not self.combo_harvester:
@@ -1678,7 +1735,7 @@ class TelegramBot:
         if message_id:
             self.edit_message(chat_id, message_id, text)
         else:
-            self.send(text, chat_id)
+            self.send_important(text, chat_id)
 
     def _do_combostats(self, chat_id, message_id=None, **_):
         if not self.combo_stats:
@@ -1700,13 +1757,13 @@ class TelegramBot:
         if message_id:
             self.edit_message(chat_id, message_id, text)
         else:
-            self.send(text, chat_id)
+            self.send_important(text, chat_id)
 
     def _start_upload(self, chat_id, kind="proxy", **_):
         """Set pending upload state and prompt user."""
         self._pending_file[chat_id] = (kind, "__upload__")
         if kind == "cookie":
-            self.send(
+            self.send_important(
                 "📤 <b>Upload Cookie File</b>\n\n"
                 "I-send ang <code>.txt</code> file na may full cookies.\n"
                 "One complete cookie string per line (lahat ng fields):\n\n"
@@ -1716,7 +1773,7 @@ class TelegramBot:
                 chat_id
             )
         elif kind == "combo":
-            self.send(
+            self.send_important(
                 "📤 <b>Upload Combo File</b>\n\n"
                 "Send a <code>.txt</code> file with accounts.\n"
                 "Formats accepted (one per line):\n"
@@ -1726,7 +1783,7 @@ class TelegramBot:
                 chat_id
             )
         else:
-            self.send(
+            self.send_important(
                 "📤 <b>Upload Proxy File</b>\n\n"
                 "Send a <code>.txt</code> file with proxies.\n"
                 "Formats accepted (one per line):\n"
@@ -1781,12 +1838,12 @@ class TelegramBot:
         try:
             content, _ = self._download_tg_file(file_id)
             if content is None:
-                self.send("❌ Could not retrieve file from Telegram.", chat_id)
+                self.send_important("❌ Could not retrieve file from Telegram.", chat_id)
                 return
             lines = list(self._iter_valid_lines(content))
             total_in_file = len(lines)
             if not lines:
-                self.send(f"❌ File <b>{fname}</b> is empty or has no valid proxies.", chat_id)
+                self.send_important(f"❌ File <b>{fname}</b> is empty or has no valid proxies.", chat_id)
                 return
             # Cap at _MAX_PROXY_LINES
             trimmed = False
@@ -1796,7 +1853,7 @@ class TelegramBot:
             self.scanner.create_file(fname, lines)
             logger.info(f"[TG] Proxy file uploaded: {fname} ({len(lines)}) from {chat_id}")
             note = f"\n⚠️ Trimmed to {self._MAX_PROXY_LINES:,} (file had {total_in_file:,})" if trimmed else ""
-            self.send(
+            self.send_important(
                 f"✅ <b>{fname}</b> uploaded!\n"
                 f"📋 Proxies loaded: <b>{len(lines):,}</b>{note}\n"
                 f"🔄 Total proxies: <b>{self.scanner.total:,}</b>",
@@ -1804,18 +1861,18 @@ class TelegramBot:
             )
         except Exception as e:
             logger.warning(f"[TG] Proxy upload error: {e}")
-            self.send(f"❌ Error: {e}", chat_id)
+            self.send_important(f"❌ Error: {e}", chat_id)
 
     def _handle_combo_file_upload(self, chat_id, file_id, fname):
         try:
             content, _ = self._download_tg_file(file_id)
             if content is None:
-                self.send("❌ Could not retrieve file from Telegram.", chat_id)
+                self.send_important("❌ Could not retrieve file from Telegram.", chat_id)
                 return
             lines = list(self._iter_valid_lines(content, skip_prefixes=("#", "===")))
             total_in_file = len(lines)
             if not lines:
-                self.send(f"❌ File <b>{fname}</b> is empty or has no valid accounts.", chat_id)
+                self.send_important(f"❌ File <b>{fname}</b> is empty or has no valid accounts.", chat_id)
                 return
             trimmed = False
             if total_in_file > self._MAX_COMBO_LINES:
@@ -1824,7 +1881,7 @@ class TelegramBot:
             self.combo_manager.create_file(fname, lines)
             logger.info(f"[TG] Combo file uploaded: {fname} ({len(lines)}) from {chat_id}")
             note = f"\n⚠️ Trimmed to {self._MAX_COMBO_LINES:,} (file had {total_in_file:,})" if trimmed else ""
-            self.send(
+            self.send_important(
                 f"✅ <b>{fname}</b> uploaded!\n"
                 f"👤 Accounts loaded: <b>{len(lines):,}</b>{note}\n"
                 f"🎯 Total accounts: <b>{self.combo_manager.total:,}</b>\n\n"
@@ -1833,18 +1890,18 @@ class TelegramBot:
             )
         except Exception as e:
             logger.warning(f"[TG] Combo upload error: {e}")
-            self.send(f"❌ Error: {e}", chat_id)
+            self.send_important(f"❌ Error: {e}", chat_id)
 
     def _handle_cookie_file_upload(self, chat_id, file_id, fname):
         try:
             content, _ = self._download_tg_file(file_id)
             if content is None:
-                self.send("❌ Could not retrieve file from Telegram.", chat_id)
+                self.send_important("❌ Could not retrieve file from Telegram.", chat_id)
                 return
             lines = list(self._iter_valid_lines(content))
             total_in_file = len(lines)
             if not lines:
-                self.send(f"❌ File <b>{fname}</b> is empty or has no valid cookies.", chat_id)
+                self.send_important(f"❌ File <b>{fname}</b> is empty or has no valid cookies.", chat_id)
                 return
             # Auto-cut at 500 lines
             trimmed = False
@@ -1858,7 +1915,7 @@ class TelegramBot:
                 f"\n⚠️ File had <b>{total_in_file:,}</b> lines — auto-cut sa <b>{self._MAX_COOKIE_LINES}</b>"
                 if trimmed else ""
             )
-            self.send(
+            self.send_important(
                 f"✅ <b>Cookie file loaded!</b>\n\n"
                 f"🍪 Cookies loaded: <b>{count}</b>{trim_note}\n\n"
                 f"Lahat ng {count} cookies ay awtomatikong maa-update ng\n"
@@ -1868,7 +1925,7 @@ class TelegramBot:
             )
         except Exception as e:
             logger.warning(f"[TG] Cookie upload error: {e}")
-            self.send(f"❌ Error: {e}", chat_id)
+            self.send_important(f"❌ Error: {e}", chat_id)
 
     def run_polling(self, shutdown_event):
         """Run polling loop in background thread."""
@@ -1876,7 +1933,7 @@ class TelegramBot:
             logger.info("[TG] No BOT_TOKEN set — Telegram bot disabled")
             return
         logger.info("[TG] Starting Telegram bot polling...")
-        self.send("🛡 DataDome Bot started! Use the buttons below to navigate.")
+        self.send_important("🛡 DataDome Bot started! Use the buttons below to navigate.")
         while not shutdown_event.is_set():
             self.poll()
             shutdown_event.wait(1)
@@ -2252,12 +2309,12 @@ class DataDomeBotEngine:
         # Wait for proxies if none loaded
         if self.scanner.total == 0:
             logger.warning("[BOT] ⚠ No proxies loaded — waiting...")
-            self.tg.send("⚠ DataDome Bot started but no proxies found!\n\nAdd proxies via:\n/proxyadd us.txt 1.2.3.4:8080\n\nOr add .txt files to the proxy folder.")
+            self.tg.send_important("⚠ DataDome Bot started but no proxies found!\n\nAdd proxies via:\n/proxyadd us.txt 1.2.3.4:8080\n\nOr add .txt files to the proxy folder.")
             while not self.shutdown_event.is_set():
                 self.scanner.rescan()
                 if self.scanner.total > 0:
                     logger.info(f"[BOT] ✔ {self.scanner.total} proxies loaded — starting!")
-                    self.tg.send(f"✅ {self.scanner.total} proxies loaded — fetch loop starting!")
+                    self.tg.send_important(f"✅ {self.scanner.total} proxies loaded — fetch loop starting!")
                     break
                 self.shutdown_event.wait(10)
 
@@ -2269,8 +2326,6 @@ class DataDomeBotEngine:
         cycle_counter = [0]
         cycle_lock = threading.Lock()
         last_stats_log = [time.time()]
-        last_tg_notify  = [0.0]           # last time we sent a TG auto-update message
-        TG_NOTIFY_EVERY = 300             # seconds between auto Telegram messages (5 min)
 
         def worker_loop(thread_id):
             while not self.shutdown_event.is_set():
@@ -2300,23 +2355,14 @@ class DataDomeBotEngine:
                     if not BOT_MODE:
                         logger.debug(f"[BOT] ✔ {dd_short} | {result.get('latency_ms', 0)}ms | proxy: {result['proxy']}")
 
-                    # ── Time-gated TG notify — only 1 message per TG_NOTIFY_EVERY seconds ──
-                    now = time.time()
-                    if now - last_tg_notify[0] >= TG_NOTIFY_EVERY:
-                        should_notify = False
-                        with cycle_lock:
-                            # Re-check inside the lock — only ONE thread wins
-                            if now - last_tg_notify[0] >= TG_NOTIFY_EVERY:
-                                last_tg_notify[0] = now  # claim the slot immediately
-                                should_notify = True
-                        if should_notify:
-                            stats = self.stats.get_stats()
-                            self.tg.send(
-                                f"🔄 <b>DataDome Live</b>\n"
-                                f"✔ Fetched: {stats['fetched']} | ↻ Updated: {stats['updated']}\n"
-                                f"⚡ Avg: {stats.get('avg_latency_ms', 0)}ms\n"
-                                f"🔄 Proxies: {self.scanner.total} | Workers: {NUM_WORKERS}"
-                            )
+                    # ── Auto-notify via TelegramBot.auto_notify — guaranteed 1 msg per interval ──
+                    stats = self.stats.get_stats()
+                    self.tg.auto_notify(
+                        f"🔄 <b>DataDome Live</b>\n"
+                        f"✔ Fetched: {stats['fetched']} | ↻ Updated: {stats['updated']}\n"
+                        f"⚡ Avg: {stats.get('avg_latency_ms', 0)}ms\n"
+                        f"🔄 Proxies: {self.scanner.total} | Workers: {NUM_WORKERS}"
+                    )
                 else:
                     self.stats.record_fetch(False)
                     current_dd = self.dd_pool.get_best()
@@ -2343,7 +2389,7 @@ class DataDomeBotEngine:
 
         # Shutdown
         logger.info("[BOT] ⚠ Shutting down...")
-        self.tg.send("⚠ DataDome Bot shutting down")
+        self.tg.send_important("⚠ DataDome Bot shutting down")
         s = self.stats.get_stats()
         logger.info(f"[BOT] 📊 Final: {s['fetched']} fetched | {s['updated']} updated | {s['failed']} failed")
         logger.info("[BOT] 👋 Goodbye!")
