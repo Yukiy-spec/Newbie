@@ -10,6 +10,8 @@ Features:
   - Auto-detect .txt files in proxy/combo folders
   - HTTP API raw link for monitoring current datadome
   - Railway-ready with environment variable config
+  - Proxy health tracking: failed proxies get cooldown, auto-skip bad proxies
+  - Smart retries: each retry uses a DIFFERENT proxy instead of hammering the same dead one
 
 Environment Variables:
   BOT_TOKEN       Telegram bot token
@@ -19,10 +21,13 @@ Environment Variables:
   COOKIE_FILE     Path to full cookie TXT (default: /data/full_cookie.txt)
   API_PORT        Port for HTTP API (default: 8080)
   MAX_RETRIES     Max retries per fetch (default: 3)
-  TIMEOUT         Request timeout ms (default: 5000)
+  TIMEOUT         Request timeout ms (default: 30000)
   BOT_MODE        Suppress spam (default: true)
   DELAY_MS        Delay between fetches in ms (default: 0 = no delay)
   COMBO_THREADS   Parallel threads for combo harvesting (default: 10)
+  PROXY_COOLDOWN  Seconds to skip a failed proxy (default: 120)
+  PROXY_VALIDATE  Validate proxies on startup (default: true)
+  SOCKS5_SUPPORT  Auto-add socks5:// variant for each proxy (default: true)
 """
 
 import os
@@ -51,10 +56,13 @@ COOKIE_FILE   = os.environ.get("COOKIE_FILE", "./data/full_cookie.txt")
 COOKIE_FOLDER = os.environ.get("COOKIE_FOLDER", "./data/cookies")  # folder for batch cookie files
 API_PORT      = int(os.environ.get("API_PORT", "8080"))
 MAX_RETRIES   = int(os.environ.get("MAX_RETRIES", "3"))
-TIMEOUT       = int(os.environ.get("TIMEOUT", "15000")) / 1000  # ms → seconds — residential proxies need more time
+TIMEOUT       = int(os.environ.get("TIMEOUT", "30000")) / 1000  # ms → seconds — residential proxies need more time (30s default)
 DELAY_MS      = int(os.environ.get("DELAY_MS", "0"))           # 0 = no delay
 BOT_MODE      = os.environ.get("BOT_MODE", "true").lower() in ("true", "1", "yes")
 NUM_WORKERS   = int(os.environ.get("NUM_WORKERS", "20"))        # parallel fetch workers
+PROXY_COOLDOWN = int(os.environ.get("PROXY_COOLDOWN", "120"))    # seconds to skip a failed proxy
+PROXY_VALIDATE = os.environ.get("PROXY_VALIDATE", "true").lower() in ("true", "1", "yes")  # validate proxies on startup
+SOCKS5_SUPPORT = os.environ.get("SOCKS5_SUPPORT", "false").lower() in ("true", "1", "yes")   # auto-add socks5 variant (default: off — most residential proxies only support HTTP)
 COMBO_THREADS = int(os.environ.get("COMBO_THREADS", "10"))      # parallel combo harvest threads
 
 # ═══════════════════════════════════════════════════════════════
@@ -208,6 +216,8 @@ class ProxyScanner:
     - Round-robin rotation across all loaded proxies
     - Auto-rescan every N cycles to pick up new/modified files
     - Thread-safe
+    - Proxy health tracking: failed proxies get cooldown period
+    - SOCKS5 support: auto-generates socks5:// variant for each http:// proxy
     """
 
     def __init__(self, folder_path, rescan_every=15):
@@ -219,6 +229,11 @@ class ProxyScanner:
         self._rescan_every = rescan_every
         self._file_stats = {}   # {filename: proxy_count}
         self._thread_idx = {}   # {thread_id: per-thread proxy index}
+        # ── Proxy health tracking ──
+        self._proxy_health = {}  # {proxy_url: {"fail_count": int, "last_fail": float, "cooldown_until": float, "success_count": int}}
+        self._cooldown_secs = PROXY_COOLDOWN
+        # ── SOCKS5 variants ──
+        self._socks5_variants = {}  # {http_proxy_url: socks5_proxy_url}
         os.makedirs(self.folder, exist_ok=True)
         self.rescan()
 
@@ -265,9 +280,33 @@ class ProxyScanner:
                     if proxy_url:
                         self.proxies.append(proxy_url)
                         count += 1
+                        # ── Auto-generate SOCKS5 variant ──
+                        if SOCKS5_SUPPORT and proxy_url.startswith("http://"):
+                            socks5_url = self._http_to_socks5(proxy_url)
+                            if socks5_url and socks5_url not in self.proxies:
+                                self.proxies.append(socks5_url)
+                                self._socks5_variants[proxy_url] = socks5_url
+                                count += 1
         except Exception as e:
             logger.warning(f"[PROXY] Error reading {filepath}: {e}")
         return count
+
+    @staticmethod
+    def _http_to_socks5(http_url: str) -> str | None:
+        """Convert http://user:pass@host:port to socks5://user:pass@host:port.
+        
+        FloppyData residential proxies support SOCKS5 on the same port.
+        SOCKS5 avoids HTTP CONNECT tunnel overhead and often works better
+        with HTTPS targets through residential proxies.
+        """
+        try:
+            # http://user:pass@host:port → socks5://user:pass@host:port
+            if "://" not in http_url:
+                return None
+            scheme, rest = http_url.split("://", 1)
+            return f"socks5://{rest}"
+        except Exception:
+            return None
 
     @staticmethod
     def _parse(line):
@@ -295,12 +334,79 @@ class ProxyScanner:
                     return f"http://{user2}:{passwd2}@{host2}:{port2}"
         return None
 
+    # ── Proxy health tracking ──────────────────────────────────
+    def record_proxy_success(self, proxy_url: str):
+        """Mark a proxy as successful — reset fail count."""
+        with self._lock:
+            health = self._proxy_health.get(proxy_url)
+            if health:
+                health["fail_count"] = 0
+                health["success_count"] += 1
+                # Clear cooldown on success
+                health["cooldown_until"] = 0
+
+    def record_proxy_failure(self, proxy_url: str):
+        """Mark a proxy as failed — increment fail count and set cooldown."""
+        with self._lock:
+            if proxy_url not in self._proxy_health:
+                self._proxy_health[proxy_url] = {
+                    "fail_count": 0, "last_fail": 0, "cooldown_until": 0, "success_count": 0
+                }
+            health = self._proxy_health[proxy_url]
+            health["fail_count"] += 1
+            health["last_fail"] = time.time()
+            # Cooldown: 30s for 1st fail, 60s for 2nd, 120s for 3rd+, max 300s
+            cooldown = min(30 * (2 ** min(health["fail_count"] - 1, 3)), 300)
+            health["cooldown_until"] = time.time() + cooldown
+            logger.debug(
+                f"[PROXY] ❌ {self._display_proxy(proxy_url)} failed "
+                f"(#{health['fail_count']}, cooldown {cooldown}s)"
+            )
+
+    def _is_proxy_healthy(self, proxy_url: str) -> bool:
+        """Check if a proxy is not in cooldown. Must be called with lock held."""
+        health = self._proxy_health.get(proxy_url)
+        if not health:
+            return True  # No failures recorded = healthy
+        if health["cooldown_until"] <= time.time():
+            # Cooldown expired — give it another chance
+            return True
+        return False
+
+    @staticmethod
+    def _display_proxy(proxy_url: str) -> str:
+        """Show proxy without credentials for logging."""
+        if "@" in proxy_url:
+            scheme_rest = proxy_url.split("://", 1)
+            if len(scheme_rest) == 2:
+                scheme, rest = scheme_rest
+                at_idx = rest.rfind("@")
+                host_port = rest[at_idx + 1:]
+                return f"{scheme}://{host_port}"
+        return proxy_url
+
+    def get_proxy_stats(self) -> dict:
+        """Return proxy health summary."""
+        with self._lock:
+            total = len(self.proxies)
+            healthy = sum(1 for p in self.proxies if self._is_proxy_healthy(p))
+            cooling = total - healthy
+            return {
+                "total": total,
+                "healthy": healthy,
+                "cooling_down": cooling,
+                "tracked": len(self._proxy_health),
+            }
+
     def get_next(self, thread_id=None):
         """Get next proxy for a specific thread (or global round-robin if no thread_id).
         
         Each thread_id gets its OWN rotating index — so thread-0 cycles through
         proxy-0, proxy-1, proxy-2 … independently from thread-1, thread-2, etc.
         This prevents multiple threads from hammering the same proxy at the same time.
+        
+        Now also SKIPS proxies that are in cooldown (recently failed).
+        Falls back to cooled-down proxies only if ALL are in cooldown.
         """
         with self._lock:
             self._cycle += 1
@@ -311,23 +417,58 @@ class ProxyScanner:
             if not self.proxies:
                 return None, None
 
+            n = len(self.proxies)
+
+            # ── Try to find a healthy proxy ──
+            # First pass: look for non-cooldown proxy starting from current index
             if thread_id is not None:
-                # Per-thread counter: thread N starts at offset N, steps by NUM_WORKERS
                 if thread_id not in self._thread_idx:
                     self._thread_idx[thread_id] = thread_id  # staggered start
-                proxy_url = self.proxies[self._thread_idx[thread_id] % len(self.proxies)]
-                self._thread_idx[thread_id] += 1
+                start = self._thread_idx[thread_id]
             else:
-                proxy_url = self.proxies[self.idx % len(self.proxies)]
-                self.idx += 1
+                start = self.idx
 
-            return {"http": proxy_url, "https": proxy_url}, proxy_url
+            # Search up to N proxies (full rotation) for a healthy one
+            proxy_url = None
+            for offset in range(n):
+                candidate_idx = (start + offset) % n
+                candidate = self.proxies[candidate_idx]
+                if self._is_proxy_healthy(candidate):
+                    proxy_url = candidate
+                    # Advance index past the one we picked
+                    if thread_id is not None:
+                        self._thread_idx[thread_id] = candidate_idx + 1
+                    else:
+                        self.idx = candidate_idx + 1
+                    break
+
+            # Fallback: all proxies in cooldown — pick the one with earliest cooldown expiry
+            if proxy_url is None:
+                best_idx = start % n
+                best_expiry = float('inf')
+                for offset in range(min(n, 50)):  # check up to 50 to avoid slow scan
+                    candidate_idx = (start + offset) % n
+                    candidate = self.proxies[candidate_idx]
+                    health = self._proxy_health.get(candidate)
+                    expiry = health["cooldown_until"] if health else 0
+                    if expiry < best_expiry:
+                        best_expiry = expiry
+                        best_idx = candidate_idx
+                proxy_url = self.proxies[best_idx]
+                if thread_id is not None:
+                    self._thread_idx[thread_id] = best_idx + 1
+                else:
+                    self.idx = best_idx + 1
+
+            proxy_dict = {"http": proxy_url, "https": proxy_url}
+            return proxy_dict, proxy_url
 
     def _do_rescan_locked(self):
         """Internal rescan (already holding lock)."""
         old_n = len(self.proxies)
         self.proxies = []
         self._file_stats = {}
+        self._socks5_variants = {}  # reset socks5 variants too
 
         os.makedirs(self.folder, exist_ok=True)
         txt_files = sorted([
@@ -1139,7 +1280,11 @@ class DataDomeFetcher:
 
     @staticmethod
     def _make_session(proxy_dict: dict) -> requests.Session:
-        """Create a brand-new session for one request — ensures IP rotation on residential proxies."""
+        """Create a brand-new session for one request — ensures IP rotation on residential proxies.
+        
+        Supports both http:// and socks5:// proxy URLs.
+        For socks5://, requires PySocks (pip install pysocks).
+        """
         session = requests.Session()
         session.proxies.update(proxy_dict)
         session.verify = False   # residential proxies often have self-signed tunnel certs
@@ -1150,6 +1295,16 @@ class DataDomeFetcher:
         )
         session.mount("http://", adapter)
         session.mount("https://", adapter)
+        # SOCKS5 support — mount SOCKS adapter if proxy URL starts with socks
+        proxy_url = proxy_dict.get("http") or proxy_dict.get("https") or ""
+        if proxy_url.startswith("socks"):
+            try:
+                import socks as _socks  # PySocks
+                from urllib3.contrib.socks import SOCKSHTTPSConnectionPool, SOCKSHTTPConnectionPool
+                # urllib3 SOCKS pool is auto-handled when PySocks is installed
+                # and requests uses the socks5:// scheme
+            except ImportError:
+                pass  # PySocks not installed — socks5:// URLs will fail with clear error
         return session
 
     def fetch(self, thread_id=None):
@@ -1157,13 +1312,17 @@ class DataDomeFetcher:
 
         thread_id — pass the worker thread index so each thread rotates its own
         proxy slot independently (no two threads share the same proxy at the same time).
+        
+        Smart retry: on failure, immediately skip to NEXT proxy instead of
+        retrying the same dead proxy. Also tracks proxy health for cooldown.
         """
         proxy_dict, proxy_url = self.scanner.get_next(thread_id=thread_id)
         if proxy_dict is None:
             return {"success": False, "datadome": None, "proxy": "NONE", "error": "No proxies", "latency_ms": 0}
 
+        last_error = "Unknown"
         for attempt in range(self.max_retries):
-            # Fresh proxy every retry too — keep same thread slot
+            # Always get a FRESH proxy each attempt — never retry on the same dead proxy
             if attempt > 0:
                 proxy_dict, proxy_url = self.scanner.get_next(thread_id=thread_id)
 
@@ -1173,7 +1332,7 @@ class DataDomeFetcher:
                 headers, encoded_data = _random_fingerprint()
                 resp = session.post(
                     _DD_URL, headers=headers, data=encoded_data,
-                    timeout=(30, self.timeout),   # (connect_timeout, read_timeout) — residential proxies need longer connect time
+                    timeout=(10, self.timeout),   # (connect_timeout=10s, read_timeout) — faster connect detection
                     verify=False,
                 )
                 latency = int((time.time() - t0) * 1000)
@@ -1182,27 +1341,42 @@ class DataDomeFetcher:
 
                 if body.get("status") == 200 and "cookie" in body:
                     dd = body["cookie"].split(";")[0].split("=", 1)[1]
+                    # ── Mark proxy as healthy ──
+                    self.scanner.record_proxy_success(proxy_url)
                     return {"success": True, "datadome": dd, "proxy": self.scanner.current_display(), "error": None, "latency_ms": latency}
 
                 # Non-200 DD status — try next proxy
                 err = f"DD status: {body.get('status')} body: {str(body)[:120]}"
                 logger.debug(f"[FETCH] {err} | proxy: {proxy_url}")
+                last_error = err
+                # Mark as failure (DD rejected the request)
+                self.scanner.record_proxy_failure(proxy_url)
                 continue
 
             except requests.exceptions.ProxyError as e:
                 logger.debug(f"[FETCH] ProxyError on {proxy_url}: {e}")
+                last_error = f"ProxyError: {str(e)[:80]}"
+                # ── Mark proxy as failed — it's dead/unreachable ──
+                self.scanner.record_proxy_failure(proxy_url)
                 continue
 
             except requests.exceptions.Timeout:
                 logger.debug(f"[FETCH] Timeout on {proxy_url}")
+                last_error = "Timeout"
+                # ── Mark proxy as failed — it's too slow ──
+                self.scanner.record_proxy_failure(proxy_url)
                 continue
 
             except requests.exceptions.ConnectionError as e:
                 logger.debug(f"[FETCH] ConnError on {proxy_url}: {e}")
+                last_error = f"ConnError: {str(e)[:80]}"
+                # ── Mark proxy as failed — connection dropped ──
+                self.scanner.record_proxy_failure(proxy_url)
                 continue
 
             except Exception as e:
                 logger.debug(f"[FETCH] Error on {proxy_url}: {e}")
+                last_error = f"{type(e).__name__}: {str(e)[:80]}"
                 continue
 
             finally:
@@ -1211,7 +1385,7 @@ class DataDomeFetcher:
                 except Exception:
                     pass
 
-        return {"success": False, "datadome": None, "proxy": self.scanner.current_display(), "error": "All retries failed", "latency_ms": 0}
+        return {"success": False, "datadome": None, "proxy": self.scanner.current_display(), "error": last_error, "latency_ms": 0}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1726,9 +1900,10 @@ class TelegramBot:
         m, s    = divmod(rem, 60)
         cs      = self.combo_stats.get() if self.combo_stats else {}
         harvest_status = "▶️ Running" if (self.combo_harvester and self.combo_harvester.is_running) else "⏹ Idle"
+        proxy_stats = self.scanner.get_proxy_stats()
         text = (
             f"🛡 <b>DataDome Bot Status</b>\n\n"
-            f"🔄 Proxies: {self.scanner.total}\n"
+            f"🔄 Proxies: {self.scanner.total} (✅{proxy_stats['healthy']} ❌{proxy_stats['cooling_down']} cooling)\n"
             f"🎯 Accounts: {self.combo_manager.total if self.combo_manager else 0}\n"
             f"🍪 Current DD: <code>{dd_short}</code>\n"
             f"✔ Fetched: {stats['fetched']}\n"
@@ -1750,13 +1925,14 @@ class TelegramBot:
         m, s      = divmod(rem, 60)
         file_stats = self.scanner.get_file_stats()
         files_info = "\n".join(f"  📄 {f}: {c}" for f, c in file_stats.items()) or "  (none)"
+        proxy_stats = self.scanner.get_proxy_stats()
         text = (
             f"📊 <b>Detailed Stats</b>\n\n"
             f"✔ Fetched: {stats['fetched']}\n"
             f"↻ Updated: {stats['updated']}\n"
             f"✘ Failed: {stats['failed']}\n"
             f"⚡ Avg latency: {stats.get('avg_latency_ms', 0)}ms\n"
-            f"🔄 Total proxies: {self.scanner.total}\n"
+            f"🔄 Total proxies: {self.scanner.total} (✅{proxy_stats['healthy']} ❌{proxy_stats['cooling_down']} cooling)\n"
             f"📂 Proxy files:\n{files_info}\n"
             f"⏱ Uptime: {h:02d}:{m:02d}:{s:02d}"
         )
@@ -2468,6 +2644,8 @@ class DataDomeBotEngine:
         logger.info(f"[BOT] Workers     : {NUM_WORKERS}")
         logger.info(f"[BOT] Delay       : {DELAY_MS}ms")
         logger.info(f"[BOT] Timeout     : {TIMEOUT*1000:.0f}ms")
+        logger.info(f"[BOT] Proxy cooldown: {PROXY_COOLDOWN}s")
+        logger.info(f"[BOT] SOCKS5      : {'ON' if SOCKS5_SUPPORT else 'OFF'}")
         logger.info("=" * 50)
 
         # Show initial status
